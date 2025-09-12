@@ -19,7 +19,7 @@ pip install -r requirements.txt
 - `ISPRS_semantic_labeling_Vaihingen.zip` (images in folder: "top")
 - `ISPRS_semantic_labeling_Vaihingen_ground_truth_COMPLETE.zip`
 
-4. Put the image files in the following folder structure:
+Put the image files in the following folder structure:
 ```
 data/
 ├── potsdam/
