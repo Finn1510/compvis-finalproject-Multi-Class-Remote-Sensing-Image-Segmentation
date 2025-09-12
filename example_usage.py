@@ -47,10 +47,6 @@ def visualize_batch(dataloader, num_samples=4, save_path=None):
         axes[1, i].set_title(f'Label {i+1}')
         axes[1, i].axis('off')
     
-    # Add colorbar for labels
-    cbar = plt.colorbar(im, ax=axes[1, :], fraction=0.046, pad=0.04)
-    cbar.set_label('Land Cover Classes')
-    
     plt.tight_layout()
     
     if save_path:
@@ -64,7 +60,7 @@ def main():
     
     # Configuration
     root_dir = "./data"
-    dataset_name = "potsdam"  # Change to 'vaihingen' or 'both' as needed
+    dataset_name = "potsdam"  # possible: 'potsdam','vaihingen','both'
     patch_size = 256
     stride = 128
     batch_size = 4

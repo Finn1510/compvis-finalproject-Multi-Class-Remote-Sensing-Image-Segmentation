@@ -160,7 +160,7 @@ class PotsdamVaihingenDataset(Dataset):
         
         for area_id in area_ids:
             img_path = os.path.join(img_dir, f'top_mosaic_09cm_area{area_id}.tif')
-            lbl_path = os.path.join(lbl_dir, f'top_mosaic_09cm_area{area_id}_label.tif')
+            lbl_path = os.path.join(lbl_dir, f'top_mosaic_09cm_area{area_id}.tif')
             
             if os.path.exists(img_path) and os.path.exists(lbl_path):
                 image_paths.append(img_path)
