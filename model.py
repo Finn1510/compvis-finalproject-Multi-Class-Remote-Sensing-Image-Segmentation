@@ -31,3 +31,23 @@ class DCBlock(nn.Module):
         return torch.cat([out, x], dim=1)
 
 
+class DDCMModule(nn.Module):
+    """Dense Dilated Convolutions Merging Module"""
+    
+    def __init__(self, in_channels, base_channels=32, dilation_rates=[1, 2, 3, 5, 7, 9], groups=1):
+        super(DDCMModule, self).__init__()
+        
+        self.dc_blocks = nn.ModuleList()
+        current_in_channels = in_channels
+        
+        for dilation_rate in dilation_rates:
+            block = DCBlock(current_in_channels, base_channels, dilation_rate, groups=groups)
+            self.dc_blocks.append(block)
+            current_in_channels += base_channels
+        
+        # Merging layer
+        final_channels = in_channels + base_channels * len(dilation_rates)
+        self.merge_conv = nn.Conv2d(final_channels, base_channels, kernel_size=1, bias=False)
+        self.merge_bn = nn.BatchNorm2d(base_channels)
+        self.merge_prelu = nn.PReLU()
+    
