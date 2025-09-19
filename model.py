@@ -449,7 +449,7 @@ class DDCMTrainer:
     
     def load_model(self, path):
         """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.history = checkpoint.get('history', self.history)
         self.class_names = checkpoint.get('class_names', self.class_names)
