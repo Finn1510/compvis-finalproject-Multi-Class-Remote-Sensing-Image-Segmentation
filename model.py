@@ -189,6 +189,38 @@ class DDCMTrainer:
             'train_miou': [], 'val_miou': []
         }
     
+    def compute_class_weights(self, dataloader, method='median_frequency'):
+        """Compute class weights for balancing"""
+        if method == 'median_frequency':
+            return self._compute_median_frequency_weights(dataloader)
+        else:
+            return None
+    
+    def _compute_median_frequency_weights(self, dataloader):
+        """Compute median frequency balancing weights"""
+        print("Computing median frequency balancing weights...")
+        class_counts = torch.zeros(self.model.num_classes)
+        total_pixels = 0
+        
+        for _, targets in tqdm(dataloader, desc="Computing class frequencies"):
+            targets = targets.to(self.device)
+            for class_id in range(self.model.num_classes):
+                class_counts[class_id] += (targets == class_id).sum().item()
+            total_pixels += targets.numel()
+        
+        # Calculate frequencies
+        frequencies = class_counts / total_pixels
+        
+        # Median frequency balancing: weight = median_freq / class_freq
+        median_freq = torch.median(frequencies)
+        weights = median_freq / (frequencies + 1e-8)  # Add small epsilon to avoid division by zero
+        
+        print(f"Class frequencies: {frequencies.numpy()}")
+        print(f"Median frequency: {median_freq:.6f}")
+        print(f"Class weights: {weights.numpy()}")
+        
+        return weights
+    
     def compute_metrics(self, outputs, targets):
         """Compute accuracy and mIoU"""
         predictions = torch.argmax(outputs, dim=1)
@@ -282,11 +314,49 @@ class DDCMTrainer:
         
         return total_loss/num_batches, total_acc/num_batches, total_miou/num_batches
     
-    def fit(self, train_loader, val_loader, epochs=50, lr=1e-4, weight_decay=1e-5):
-        """Train the model"""
-        # Setup
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+    def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, class_weights=None, use_mfb=True):
+        """
+        Train the model using best practices from the DDCM-Net paper:
+        - Adam optimizer with AMSGrad
+        - Weight decay 2e-5 applied only to weights (not biases/batch-norm)
+        - Learning rate 8.5e-5/√2 ≈ 6.01e-5 for weights, 2x for biases
+        - StepLR schedule: 0.85 decay every 15 epochs
+        - Cross-entropy loss with median frequency balancing (MFB)
+        """
+        # Compute median frequency balancing weights if requested and not provided
+        if use_mfb and class_weights is None:
+            class_weights = self.compute_class_weights(train_loader, method='median_frequency')
+        
+        # Setup parameter groups with different weight decay and learning rates
+        weight_params = []
+        bias_params = []
+        bn_params = []
+        
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            if 'bias' in name:
+                bias_params.append(param)
+            elif 'bn' in name or 'norm' in name:
+                bn_params.append(param)
+            else:
+                weight_params.append(param)
+        
+        # Parameter groups: weights with weight decay, biases with 2x LR, batch-norm without weight decay
+        param_groups = [
+            {'params': weight_params, 'lr': lr, 'weight_decay': weight_decay},
+            {'params': bias_params, 'lr': 2 * lr, 'weight_decay': 0.0},
+            {'params': bn_params, 'lr': lr, 'weight_decay': 0.0}
+        ]
+        
+        # Setup loss function with class weights if provided
+        if class_weights is not None:
+            criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=self.device))
+        else:
+            criterion = nn.CrossEntropyLoss()
+        
+        optimizer = torch.optim.Adam(param_groups, amsgrad=True)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
         
         best_miou = 0

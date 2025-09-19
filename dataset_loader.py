@@ -52,7 +52,6 @@ class PotsdamVaihingenDataset(Dataset):
                  dataset: str = 'potsdam',
                  split: str = 'train',
                  patch_size: int = 256,
-                 stride: int = 128,
                  transform: Optional[transforms.Compose] = None,
                  target_transform: Optional[transforms.Compose] = None,
                  augment: bool = True):
@@ -62,7 +61,6 @@ class PotsdamVaihingenDataset(Dataset):
             dataset: 'potsdam', 'vaihingen', or 'both'
             split: 'train', 'val', or 'test'
             patch_size: Size of patches to extract (default: 256)
-            stride: Stride for patch extraction (default: 128)
             transform: Optional transform to be applied on images
             target_transform: Optional transform to be applied on labels
             augment: Whether to apply data augmentation (only for training)
@@ -71,7 +69,6 @@ class PotsdamVaihingenDataset(Dataset):
         self.dataset = dataset.lower()
         self.split = split
         self.patch_size = patch_size
-        self.stride = stride
         self.transform = transform
         self.target_transform = target_transform
         self.augment = augment and (split == 'train')  # Only augment training data
@@ -169,24 +166,60 @@ class PotsdamVaihingenDataset(Dataset):
         return image_paths, label_paths
 
     def _extract_patches(self) -> List[Tuple[str, str, int, int]]:
-        """Extract patch coordinates from images."""
+        """Extract random patches from images (paper-compliant approach)."""
+        import random
+        
+        # Set seeds for reproducibility
+        random.seed(42)
+        np.random.seed(42)
+        
+        # Determine target number of patches based on paper specifications
+        target_patches = {
+            'train': 5000,   # Paper specification
+            'val': 1000,     # Smaller validation set
+            'test': 1000     # Test set for evaluation
+        }
+        
+        num_patches = target_patches.get(self.split, 1000)
         patches = []
         
+        print(f"Randomly sampling {num_patches} patches for {self.split} split...")
+        
+        # Collect valid image information for random sampling
+        valid_images = []
         for img_path, lbl_path in zip(self.image_paths, self.label_paths):
             try:
                 # Load image to get dimensions
                 with Image.open(img_path) as img:
                     width, height = img.size
                 
-                # Extract patches with given stride
-                for y in range(0, height - self.patch_size + 1, self.stride):
-                    for x in range(0, width - self.patch_size + 1, self.stride):
-                        patches.append((img_path, lbl_path, x, y))
-                        
+                # Check if image is large enough for patches
+                max_x = width - self.patch_size
+                max_y = height - self.patch_size
+                
+                if max_x > 0 and max_y > 0:
+                    valid_images.append((img_path, lbl_path, max_x, max_y))
+                    
             except Exception as e:
                 print(f"Error processing {img_path}: {e}")
                 continue
-                
+        
+        if not valid_images:
+            print("No valid images found for patch extraction!")
+            return patches
+        
+        # Randomly sample patches
+        for i in range(num_patches):
+            # Randomly select an image
+            img_path, lbl_path, max_x, max_y = random.choice(valid_images)
+            
+            # Randomly select patch position within the image
+            x = random.randint(0, max_x)
+            y = random.randint(0, max_y)
+            
+            patches.append((img_path, lbl_path, x, y))
+        
+        print(f"Successfully extracted {len(patches)} random patches")
         return patches
 
     def _rgb_to_class_mask(self, rgb_label: np.ndarray) -> np.ndarray:
@@ -314,7 +347,6 @@ def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compos
 def create_dataloaders(root_dir: str,
                       dataset: str = 'potsdam',
                       patch_size: int = 256,
-                      stride: int = 128,
                       batch_size: int = 16,
                       num_workers: int = 4
                       ) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -325,7 +357,6 @@ def create_dataloaders(root_dir: str,
         root_dir: Root directory for datasets
         dataset: 'potsdam', 'vaihingen', or 'both'
         patch_size: Size of patches (default: 256)
-        stride: Stride for patch extraction (default: 128)
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes
         
@@ -343,7 +374,6 @@ def create_dataloaders(root_dir: str,
         dataset=dataset,
         split='train',
         patch_size=patch_size,
-        stride=stride,
         transform=train_transform,
         target_transform=train_target_transform,
         augment=True
@@ -354,7 +384,6 @@ def create_dataloaders(root_dir: str,
         dataset=dataset,
         split='val',
         patch_size=patch_size,
-        stride=stride,
         transform=val_transform,
         target_transform=val_target_transform,
         augment=False
@@ -365,7 +394,6 @@ def create_dataloaders(root_dir: str,
         dataset=dataset,
         split='test',
         patch_size=patch_size,
-        stride=stride,
         transform=val_transform,
         target_transform=val_target_transform,
         augment=False
@@ -407,7 +435,6 @@ if __name__ == "__main__":
         root_dir=root_dir,
         dataset='potsdam',  # or 'vaihingen' or 'both'
         patch_size=256,
-        stride=128,
         batch_size=8,
         num_workers=2
     )
