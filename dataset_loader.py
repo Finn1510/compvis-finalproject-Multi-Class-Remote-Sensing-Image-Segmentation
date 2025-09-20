@@ -112,15 +112,14 @@ class PotsdamVaihingenDataset(Dataset):
         
         # Potsdam train/test split convention
         if self.split == 'train':
-            # Areas 2_10, 2_13, 2_14, 3_10, 3_11, 3_12, 3_13, 4_10, 4_12, 4_13, 4_14, 5_10, 5_12, 5_13, 5_14, 5_15, 6_8, 6_9, 6_10, 6_11, 6_12, 6_13, 6_15, 7_7, 7_9, 7_11, 2_11, 2_12, 3_14, 4_11, 7_13
-            area_ids = ['2_10', '2_13', '2_14', '3_10', '3_11', '3_12', '3_13', '4_10', '4_12', '4_13', '4_14', '5_10', '5_12', '5_13', '5_14', '5_15', '6_8', '6_9', '6_10', '6_11', '6_12', '6_13', '6_15', '7_7', '7_9', '7_11', '2_11', '2_12', '3_14', '4_11', '7_13']
+            area_ids = ['2_10', '2_11', '2_12', '3_10', '3_11', '3_12', '4_11', '4_12', '5_10', '5_12', '6_7', '6_8', '6_10', '6_11', '6_12', '7_7', '7_9', '7_8', '7_12']
         elif self.split == 'test':
-            # Areas 4_15, 5_11, 6_7, 6_11
-            area_ids = ['4_15', '5_11', '6_7', '6_11']
-        else:
-            # Areas 6_14, 7_8, 7_10, 7_12
-            area_ids = ['6_14', '7_8', '7_10', '7_12']
-            
+            area_ids = ['5_11', '6_9', '7_11']
+        elif self.split == 'val':
+            area_ids = ['4_10', '7_10']
+        else: # holdout
+            area_ids = ['2_13', '2_14', '3_13', '3_14', '4_13', '4_14', '4_15', '5_13', '5_14', '5_15', '6_13', '6_14', '6_15', '7_13']
+
         image_paths = []
         label_paths = []
         
@@ -144,13 +143,14 @@ class PotsdamVaihingenDataset(Dataset):
             warnings.warn(f"Vaihingen dataset not found in {self.root_dir}/vaihingen/")
             return [], []
         
-        # Vaihingen areas: 1-38
         if self.split == 'train':
-            area_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+            area_ids = [1, 3, 7, 9, 11, 13, 17, 18, 19, 23, 25, 26, 28, 32, 34, 36, 37]
         elif self.split == 'test':
-            area_ids = [31, 32, 33, 34]
-        else:  # val
-            area_ids = [35, 36, 37, 38]
+            area_ids = [5, 15, 21, 30]
+        elif self.split == 'val':
+            area_ids = [7, 9]
+        else: # holdout
+            area_ids = [2, 4, 6, 8, 10, 12, 14, 16, 20, 22, 24, 27, 29, 31, 33, 35, 38]
             
         image_paths = []
         label_paths = []
@@ -349,7 +349,7 @@ def create_dataloaders(root_dir: str,
                       patch_size: int = 256,
                       batch_size: int = 16,
                       num_workers: int = 4
-                      ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+                      ) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders.
     
@@ -398,6 +398,16 @@ def create_dataloaders(root_dir: str,
         target_transform=val_target_transform,
         augment=False
     )
+
+    holdout_dataset= PotsdamVaihingenDataset(
+        root_dir=root_dir,
+        dataset=dataset,
+        split='holdout',
+        patch_size=patch_size,
+        transform=val_transform,
+        target_transform=val_target_transform,
+        augment=False
+    )
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -423,15 +433,23 @@ def create_dataloaders(root_dir: str,
         num_workers=num_workers,
         pin_memory=True
     )
+
+    holdout_loader = DataLoader(
+        holdout_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, holdout_loader
 
 
 if __name__ == "__main__":
     root_dir = "./data"
     
     # Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(
+    train_loader, val_loader, test_loader, holdout_loader = create_dataloaders(
         root_dir=root_dir,
         dataset='potsdam',  # or 'vaihingen' or 'both'
         patch_size=256,
