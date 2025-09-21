@@ -287,6 +287,55 @@ class PotsdamVaihingenDataset(Dataset):
             
         return img_tensor, lbl_tensor
 
+    def get_full_image(self, image_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load a full-resolution image and its corresponding label for TTA evaluation.
+        
+        Args:
+            image_idx: Index of the image to load (from available image paths)
+            
+        Returns:
+            Tuple of (full_image_tensor, full_label_tensor)
+        """
+        if image_idx >= len(self.image_paths):
+            raise IndexError(f"Image index {image_idx} out of range. Available: {len(self.image_paths)}")
+        
+        img_path = self.image_paths[image_idx]
+        lbl_path = self.label_paths[image_idx]
+        
+        print(f"Loading full resolution image: {os.path.basename(img_path)}")
+        
+        # Load full image
+        with Image.open(img_path) as img:
+            img_array = np.array(img)
+            print(f"Full image size: {img_array.shape}")
+            
+        # Load full label
+        with Image.open(lbl_path) as lbl:
+            lbl_array = np.array(lbl)
+            
+        # Convert RGB labels to class indices if needed
+        if len(lbl_array.shape) == 3 and lbl_array.shape[2] == 3:
+            lbl_array = self._rgb_to_class_mask(lbl_array)
+            
+        # Convert to tensors
+        img_tensor = transforms.ToTensor()(Image.fromarray(img_array))
+        lbl_tensor = torch.from_numpy(lbl_array.astype(np.uint8)).long()
+        
+        # Apply normalization to image
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                       std=[0.229, 0.224, 0.225])
+        img_tensor = normalize(img_tensor)
+        
+        # Add batch dimension
+        img_tensor = img_tensor.unsqueeze(0)  # [1, 3, H, W]
+        
+        return img_tensor, lbl_tensor
+
+    def get_available_images(self) -> List[str]:
+        """Get list of available full-resolution image names."""
+        return [os.path.basename(path) for path in self.image_paths]
+
     def visualize_sample(self, idx: int, save_path: Optional[str] = None):
         """Visualize a sample from the dataset."""
         img, lbl = self[idx]
