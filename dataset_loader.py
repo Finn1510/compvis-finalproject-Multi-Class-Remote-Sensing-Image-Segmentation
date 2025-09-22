@@ -10,6 +10,7 @@ from torchvision.transforms import functional as F
 import matplotlib.pyplot as plt
 from typing import Tuple, Optional, List
 import warnings
+import random
 
 class PotsdamVaihingenDataset(Dataset):
     """
@@ -79,10 +80,10 @@ class PotsdamVaihingenDataset(Dataset):
         # Load image and label paths
         self.image_paths, self.label_paths = self._load_file_paths()
         
-        # Extract patches
-        self.patches = self._extract_patches()
+        # Prepare valid images for dynamic patch sampling
+        self.valid_images, self.num_patches = self._prepare_valid_images()
         
-        print(f"Loaded {len(self.patches)} patches from {self.dataset} dataset ({self.split} split)")
+        print(f"Prepared {len(self.valid_images)} images for dynamic sampling of {self.num_patches} patches from {self.dataset} dataset ({self.split} split)")
 
     def _load_file_paths(self) -> Tuple[List[str], List[str]]:
         """Load image and label file paths based on dataset and split."""
@@ -165,13 +166,8 @@ class PotsdamVaihingenDataset(Dataset):
                 
         return image_paths, label_paths
 
-    def _extract_patches(self) -> List[Tuple[str, str, int, int]]:
-        """Extract random patches from images (paper-compliant approach)."""
-        import random
-        
-        # Set seeds for reproducibility
-        random.seed(42)
-        np.random.seed(42)
+    def _prepare_valid_images(self) -> Tuple[List[Tuple[str, str, int, int]], int]:
+        """Prepare valid images for dynamic patch sampling."""
         
         # Determine target number of patches based on paper specifications
         target_patches = {
@@ -181,9 +177,8 @@ class PotsdamVaihingenDataset(Dataset):
         }
         
         num_patches = target_patches.get(self.split, 1000)
-        patches = []
         
-        print(f"Randomly sampling {num_patches} patches for {self.split} split...")
+        print(f"Preparing images for dynamic sampling of {num_patches} patches for {self.split} split...")
         
         # Collect valid image information for random sampling
         valid_images = []
@@ -206,21 +201,10 @@ class PotsdamVaihingenDataset(Dataset):
         
         if not valid_images:
             print("No valid images found for patch extraction!")
-            return patches
+            return [], num_patches
         
-        # Randomly sample patches
-        for i in range(num_patches):
-            # Randomly select an image
-            img_path, lbl_path, max_x, max_y = random.choice(valid_images)
-            
-            # Randomly select patch position within the image
-            x = random.randint(0, max_x)
-            y = random.randint(0, max_y)
-            
-            patches.append((img_path, lbl_path, x, y))
-        
-        print(f"Successfully extracted {len(patches)} random patches")
-        return patches
+        print(f"Successfully prepared {len(valid_images)} images for dynamic patch sampling")
+        return valid_images, num_patches
 
     def _rgb_to_class_mask(self, rgb_label: np.ndarray) -> np.ndarray:
         """Convert RGB label to class mask."""
@@ -234,10 +218,15 @@ class PotsdamVaihingenDataset(Dataset):
         return class_mask
 
     def __len__(self) -> int:
-        return len(self.patches)
+        return self.num_patches
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_path, lbl_path, x, y = self.patches[idx]
+        # Randomly select an image from valid images
+        img_path, lbl_path, max_x, max_y = random.choice(self.valid_images)
+        
+        # Randomly select patch position within the image
+        x = random.randint(0, max_x)
+        y = random.randint(0, max_y)
         
         # Load image patch
         with Image.open(img_path) as img:

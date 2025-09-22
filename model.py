@@ -9,6 +9,19 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+class PolynomialLR(torch.optim.lr_scheduler._LRScheduler):
+    """Polynomial learning rate decay scheduler"""
+    
+    def __init__(self, optimizer, max_iter, power=0.9, last_epoch=-1):
+        self.max_iter = max_iter
+        self.power = power
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        return [base_lr * (1 - self.last_epoch / self.max_iter) ** self.power
+                for base_lr in self.base_lrs]
+
+
 class DCBlock(nn.Module):
     """Dilated CNN-stack (DC) block with dense connections"""
     
@@ -112,12 +125,12 @@ class DDCMNet(nn.Module):
         
         # High-level decoders
         self.high_level_decoder1 = DDCMModule(
-            in_channels=1024, base_channels=9,
+            in_channels=1024, base_channels=36,
             dilation_rates=[1, 2, 3, 4]
         )
         
         self.high_level_decoder2 = DDCMModule(
-            in_channels=9, base_channels=18,
+            in_channels=36, base_channels=18,
             dilation_rates=[1]
         )
         
@@ -314,14 +327,19 @@ class DDCMTrainer:
         
         return total_loss/num_batches, total_acc/num_batches, total_miou/num_batches
     
-    def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, class_weights=None, use_mfb=True):
+    def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, 
+            class_weights=None, use_mfb=True, lr_scheduler='step'):
         """
         Train the model using best practices from the DDCM-Net paper:
         - Adam optimizer with AMSGrad
         - Weight decay 2e-5 applied only to weights (not biases/batch-norm)
         - Learning rate 8.5e-5/√2 ≈ 6.01e-5 for weights, 2x for biases
-        - StepLR schedule: 0.85 decay every 15 epochs
+        - StepLR schedule: 0.85 decay every 15 epochs (default)
+        - Alternative: Polynomial decay with power 0.9
         - Cross-entropy loss with median frequency balancing (MFB)
+        
+        Args:
+            lr_scheduler: 'step' for StepLR (default) or 'poly' for polynomial decay
         """
         # Compute median frequency balancing weights if requested and not provided
         if use_mfb and class_weights is None:
@@ -357,7 +375,13 @@ class DDCMTrainer:
             criterion = nn.CrossEntropyLoss()
         
         optimizer = torch.optim.Adam(param_groups, amsgrad=True)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
+        
+        # Setup learning rate scheduler
+        if lr_scheduler == 'poly':
+            max_iter = epochs * len(train_loader)
+            scheduler = PolynomialLR(optimizer, max_iter, power=0.9)
+        else:  # default: step
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
         
         best_miou = 0
         
