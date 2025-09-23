@@ -30,7 +30,7 @@ data/
     └── labels/
 ```
 
-## 📊 Dataset Information
+## Dataset Information
 
 ### Land Cover Classes
 
