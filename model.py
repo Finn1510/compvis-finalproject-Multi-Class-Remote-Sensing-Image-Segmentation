@@ -159,21 +159,31 @@ class DDCMNet(nn.Module):
     def forward(self, x):
         input_size = x.shape[2:]
         
-        # Low-level features
+        # Low-level features path: Input -> DDCM -> 0.5 pool -> half resolution
         low_features = self.low_level_encoder(x)
-        
-        # High-level features
-        high_features = self.backbone(x)
-        high_decoded1 = self.high_level_decoder1(high_features)
-        high_decoded2 = self.high_level_decoder2(high_decoded1)
-        
-        # Upsample and fuse
-        high_upsampled = F.interpolate(
-            high_decoded2, size=low_features.shape[2:], 
+        # Apply 0.5 pooling as specified in the paper
+        low_features = F.interpolate(
+            low_features, scale_factor=0.5, 
             mode='bilinear', align_corners=False
         )
         
-        fused = torch.cat([low_features, high_upsampled], dim=1)
+        # High-level features path: Input -> Backbone -> DDCM1 -> 4x up -> DDCM2 -> 2x up -> half resolution
+        high_features = self.backbone(x)
+        high_decoded1 = self.high_level_decoder1(high_features)
+        # Apply 4x upsampling as specified in the paper (32 -> 128)
+        high_decoded1 = F.interpolate(
+            high_decoded1, scale_factor=4, 
+            mode='bilinear', align_corners=False
+        )
+        high_decoded2 = self.high_level_decoder2(high_decoded1)
+        # Apply 2x upsampling to match low-level features (128 -> 256)
+        high_decoded2 = F.interpolate(
+            high_decoded2, scale_factor=2, 
+            mode='bilinear', align_corners=False
+        )
+        
+        # Both paths should be at half resolution for fusion
+        fused = torch.cat([low_features, high_decoded2], dim=1)
         
         # Final prediction
         x = self.fusion_conv(fused)
@@ -181,6 +191,7 @@ class DDCMNet(nn.Module):
         x = self.fusion_relu(x)
         x = self.classifier(x)
         
+        # Upsample back to original input size
         return F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
 
 
@@ -195,7 +206,6 @@ class DDCMTrainer:
             'Impervious', 'Building', 'Low_veg', 'Tree', 'Car', 'Clutter'
         ]
         
-        # Training history
         self.history = {
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
