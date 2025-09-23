@@ -221,7 +221,11 @@ class PotsdamVaihingenDataset(Dataset):
         return self.num_patches
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Randomly select an image from valid images
+        # Note: Each call to __getitem__ provides uniform random sampling
+        # The 'idx' parameter is ignored in favor of true random sampling
+        # This ensures uniform random sampling across the entire dataset for each epoch
+        
+        # Randomly select an image from valid images (uniform sampling)
         img_path, lbl_path, max_x, max_y = random.choice(self.valid_images)
         
         # Randomly select patch position within the image
@@ -248,12 +252,15 @@ class PotsdamVaihingenDataset(Dataset):
         
         # Apply synchronized augmentation if enabled
         if self.augment:
-            # Random horizontal flip
+            # Paper: "randomly flip or mirror images for data augmentation (with probability 0.5)"
+            # Standard interpretation: each augmentation has 0.5 probability independently
+            
+            # Random horizontal flip (mirroring) with probability 0.5
             if torch.rand(1) < 0.5:
                 img_tensor = F.hflip(img_tensor)
                 lbl_tensor = F.hflip(lbl_tensor)
             
-            # Random vertical flip
+            # Random vertical flip with probability 0.5
             if torch.rand(1) < 0.5:
                 img_tensor = F.vflip(img_tensor)
                 lbl_tensor = F.vflip(lbl_tensor)
@@ -367,6 +374,16 @@ class PotsdamVaihingenDataset(Dataset):
             plt.show()
 
 
+def worker_init_fn(worker_id):
+    """Initialize each worker with a different random seed for data augmentation"""
+    # Get initial seed and ensure it's within valid range for numpy
+    base_seed = torch.initial_seed()
+    # Ensure seed is within numpy's valid range (0 to 2^32 - 1)
+    worker_seed = (base_seed + worker_id) % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compose], Optional[transforms.Compose]]:
     """Get data transforms for training/validation."""
     
@@ -386,7 +403,9 @@ def create_dataloaders(root_dir: str,
                       dataset: str = 'potsdam',
                       patch_size: int = 256,
                       batch_size: int = 16,
-                      num_workers: int = 4
+                      num_workers: int = 4,
+                      pin_memory: bool = True,
+                      drop_last: bool = True
                       ) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders.
@@ -397,9 +416,11 @@ def create_dataloaders(root_dir: str,
         patch_size: Size of patches (default: 256)
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes
+        pin_memory: Whether to use pinned memory for faster GPU transfer
+        drop_last: Whether to drop the last incomplete batch (recommended for training)
         
     Returns:
-        Tuple of (train_loader, val_loader, test_loader)
+        Tuple of (train_loader, val_loader, test_loader, holdout_loader)
     """
     
     # Get transforms
@@ -451,33 +472,38 @@ def create_dataloaders(root_dir: str,
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=True,                    # Essential for training: randomizes batch composition
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,          # Faster GPU transfer
+        drop_last=drop_last,            # Ensures consistent batch sizes for training
+        worker_init_fn=worker_init_fn   # Ensures different seeds for each worker
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False,                  # No shuffling needed for validation
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        drop_last=False                 # Keep all validation data
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False,                  # No shuffling needed for testing
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        drop_last=False                 # Keep all test data
     )
 
     holdout_loader = DataLoader(
         holdout_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False,                  # No shuffling needed for holdout evaluation
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        drop_last=False                 # Keep all holdout data
     )
     
     return train_loader, val_loader, test_loader, holdout_loader
