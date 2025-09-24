@@ -431,6 +431,111 @@ class DDCMTrainer:
         print(f"\nTraining completed! Best mIoU: {best_miou:.3f}")
         return self.history
     
+    def continue_training(self, train_loader, val_loader, additional_epochs=20, 
+                         current_epoch=0, initial_lr=8.5e-5 / np.sqrt(2), weight_decay=2e-5):
+        """
+        Continue training from a checkpoint with proper learning rate schedule.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader  
+            additional_epochs: How many more epochs to train
+            current_epoch: The epoch number where previous training stopped
+            initial_lr: The initial learning rate used in original training
+            weight_decay: Weight decay parameter
+        
+        Returns:
+            Updated training history dictionary
+        """
+        # Calculate current learning rate based on StepLR schedule (decay 0.85 every 15 epochs)
+        # LR = initial_lr * (0.85 ** (current_epoch // 15))
+        decay_factor = 0.85 ** (current_epoch // 15)
+        current_lr = initial_lr * decay_factor
+        
+        print(f"Resuming training from epoch {current_epoch + 1}")
+        print(f"Initial LR was: {initial_lr:.2e}")
+        print(f"Current LR will be: {current_lr:.2e} (decay factor: {decay_factor:.4f})")
+        print(f"Training for {additional_epochs} more epochs")
+        
+        # Setup parameter groups with current learning rate
+        weight_params = []
+        bias_params = []
+        bn_params = []
+        
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            if 'bias' in name:
+                bias_params.append(param)
+            elif 'bn' in name or 'norm' in name:
+                bn_params.append(param)
+            else:
+                weight_params.append(param)
+        
+        # Parameter groups: weights with weight decay, biases with 2x LR, batch-norm without weight decay
+        param_groups = [
+            {'params': weight_params, 'lr': current_lr, 'weight_decay': weight_decay},
+            {'params': bias_params, 'lr': 2 * current_lr, 'weight_decay': 0.0},
+            {'params': bn_params, 'lr': current_lr, 'weight_decay': 0.0}
+        ]
+        
+        # Setup optimizer and scheduler
+        optimizer = torch.optim.Adam(param_groups, amsgrad=True)
+        
+        # Create scheduler starting from current epoch
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
+        
+        # Advance scheduler to current position
+        for _ in range(current_epoch):
+            scheduler.step()
+        
+        # Setup loss function (recompute class weights if using MFB)
+        print("Computing class weights for continued training...")
+        class_weights = self.compute_class_weights(train_loader, method='median_frequency')
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=self.device))
+        
+        # Track best mIoU from previous training
+        best_miou = max(self.history['val_miou']) if self.history['val_miou'] else 0
+        print(f"Previous best mIoU: {best_miou:.3f}")
+        
+        # Continue training loop
+        start_epoch = len(self.history['train_loss'])
+        
+        for epoch in range(start_epoch, start_epoch + additional_epochs):
+            print(f"\nEpoch {epoch+1}/{start_epoch + additional_epochs}")
+            print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Train
+            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion)
+            
+            # Validate  
+            val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
+            
+            # Update scheduler
+            scheduler.step()
+            
+            # Save history
+            self.history['train_loss'].append(train_loss)
+            self.history['val_loss'].append(val_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_acc'].append(val_acc)
+            self.history['train_miou'].append(train_miou)
+            self.history['val_miou'].append(val_miou)
+            
+            # Print metrics
+            print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.3f}, mIoU: {train_miou:.3f}")
+            print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.3f}, mIoU: {val_miou:.3f}")
+            
+            # Save best model
+            if val_miou > best_miou:
+                best_miou = val_miou
+                self.save_model('best_model.pth')
+                print(f"New best model saved! mIoU: {best_miou:.3f}")
+        
+        print(f"\nContinued training completed! Final best mIoU: {best_miou:.3f}")
+        return self.history
+    
     def plot_training_history(self, figsize=(15, 5)):
         """Plot training history"""
         if not self.history['train_loss']:
