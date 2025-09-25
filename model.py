@@ -39,8 +39,8 @@ class DCBlock(nn.Module):
     
     def forward(self, x):
         out = self.dilated_conv(x)
-        out = self.bn(out)
         out = self.prelu(out)
+        out = self.bn(out)
         return torch.cat([out, x], dim=1)
 
 
@@ -70,8 +70,8 @@ class DDCMModule(nn.Module):
             current_input = dc_block(current_input)
         
         out = self.merge_conv(current_input)
-        out = self.merge_bn(out)
         out = self.merge_prelu(out)
+        out = self.merge_bn(out)
         return out
 
 
@@ -134,11 +134,8 @@ class DDCMNet(nn.Module):
             dilation_rates=[1]
         )
         
-        # Fusion and classification
-        self.fusion_conv = nn.Conv2d(21, 64, kernel_size=3, padding=1)  # 3 + 18 = 21
-        self.fusion_bn = nn.BatchNorm2d(64)
-        self.fusion_relu = nn.ReLU(inplace=True)
-        self.classifier = nn.Conv2d(64, num_classes, kernel_size=1)
+        # Fusion and classification 
+        self.classifier = nn.Conv2d(21, num_classes, kernel_size=3, padding=1)  # 3 + 18 = 21
         
         self._init_weights()
     
@@ -185,13 +182,10 @@ class DDCMNet(nn.Module):
         # Both paths should be at half resolution for fusion
         fused = torch.cat([low_features, high_decoded2], dim=1)
         
-        # Final prediction
-        x = self.fusion_conv(fused)
-        x = self.fusion_bn(x)
-        x = self.fusion_relu(x)
-        x = self.classifier(x)
+        # Final prediction 
+        x = self.classifier(fused)
         
-        # Upsample back to original input size
+        # Upsample back to original input size (up-argmax pipeline)
         return F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
 
 
