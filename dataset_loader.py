@@ -252,9 +252,6 @@ class PotsdamVaihingenDataset(Dataset):
         
         # Apply synchronized augmentation if enabled
         if self.augment:
-            # Paper: "randomly flip or mirror images for data augmentation (with probability 0.5)"
-            # Standard interpretation: each augmentation has 0.5 probability independently
-            
             # Random horizontal flip (mirroring) with probability 0.5
             if torch.rand(1) < 0.5:
                 img_tensor = F.hflip(img_tensor)
@@ -265,18 +262,14 @@ class PotsdamVaihingenDataset(Dataset):
                 img_tensor = F.vflip(img_tensor)
                 lbl_tensor = F.vflip(lbl_tensor)
         
-        # Apply normalization to image
         if self.transform:
-            # Apply additional transforms (like normalization)
+            # Apply additional transforms
             # But skip ToTensor since we already converted
             for t in self.transform.transforms:
                 if not isinstance(t, transforms.ToTensor):
                     img_tensor = t(img_tensor)
-        else:
-            # Apply default normalization
-            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                           std=[0.229, 0.224, 0.225])
-            img_tensor = normalize(img_tensor)
+        
+        # ToTensor already converted from [0, 255] to [0.0, 1.0], so we keep this normalization
             
         # Convert label to long tensor
         lbl_tensor = lbl_tensor.long()
@@ -318,10 +311,7 @@ class PotsdamVaihingenDataset(Dataset):
         img_tensor = transforms.ToTensor()(Image.fromarray(img_array))
         lbl_tensor = torch.from_numpy(lbl_array.astype(np.uint8)).long()
         
-        # Apply normalization to image
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                       std=[0.229, 0.224, 0.225])
-        img_tensor = normalize(img_tensor)
+        # ToTensor already provides [0.0, 1.0] normalization, so we keep it as is
         
         # Add batch dimension
         img_tensor = img_tensor.unsqueeze(0)  # [1, 3, H, W]
@@ -383,15 +373,11 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
     np.random.seed(worker_seed)
 
-
+# TODO Refactor this
 def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compose], Optional[transforms.Compose]]:
     """Get data transforms for training/validation."""
     
-    # For images, we just need normalization (ToTensor and augmentation handled in __getitem__)
-    img_transform = transforms.Compose([
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225]),
-    ])
+    img_transform = None  # No additional transforms needed - images stay in [0.0, 1.0] range
         
     # For labels, just convert to long tensor (already handled in __getitem__)
     lbl_transform = None
