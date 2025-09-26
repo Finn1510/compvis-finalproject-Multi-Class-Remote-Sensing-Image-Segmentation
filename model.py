@@ -718,9 +718,402 @@ class DDCMTrainer:
         self.class_names = checkpoint.get('class_names', self.class_names)
 
 
-def create_model(variant='base', num_classes=6, backbone='resnet50', pretrained=True):
-    """Create DDCM-Net model"""
-    return DDCMNet(num_classes, backbone, pretrained)
+# ==================== ENHANCED MODEL WITH SELF-ATTENTION ====================
+
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention module for global context modeling"""
+    
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super(MultiHeadSelfAttention, self).__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+        
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        B, N, C = x.shape  # Batch, Num_patches, Channels
+        
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, num_heads, N, head_dim)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+        
+        return x
+
+
+class WindowedAttention(nn.Module):
+    """Windowed multi-head self-attention for efficient computation on high-res features"""
+    
+    def __init__(self, dim, window_size=7, num_heads=8, dropout=0.1):
+        super(WindowedAttention, self).__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
+        )
+        
+        # Get pair-wise relative position indices
+        coords_h = torch.arange(self.window_size)
+        coords_w = torch.arange(self.window_size)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size - 1
+        relative_coords[:, :, 1] += self.window_size - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
+        
+    def forward(self, x, H, W):
+        """
+        Args:
+            x: input features with shape of (B, H*W, C)
+            H, W: spatial resolution of the input feature map
+        """
+        B, N, C = x.shape
+        assert N == H * W, f"Input feature has wrong size: {N} vs {H*W}"
+        
+        # Reshape to spatial format
+        x = x.view(B, H, W, C)
+        
+        # Pad feature map if needed
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, Hp, Wp, _ = x.shape
+        
+        # Partition windows
+        x_windows = self.window_partition(x, self.window_size)  # (B*num_windows, window_size, window_size, C)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # (B*num_windows, window_size*window_size, C)
+        
+        # W-MSA
+        attn_windows = self.window_attention(x_windows)  # (B*num_windows, window_size*window_size, C)
+        
+        # Merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        x = self.window_reverse(attn_windows, self.window_size, Hp, Wp)  # (B, Hp, Wp, C)
+        
+        # Remove padding if needed
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+        
+        x = x.view(B, H * W, C)
+        return x
+    
+    def window_partition(self, x, window_size):
+        """Partition feature map into non-overlapping windows"""
+        B, H, W, C = x.shape
+        x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+        return windows
+    
+    def window_reverse(self, windows, window_size, H, W):
+        """Reverse window partition"""
+        B = int(windows.shape[0] / (H * W / window_size / window_size))
+        x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+        return x
+    
+    def window_attention(self, x):
+        """Window based multi-head self attention"""
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+        
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].reshape(
+            self.window_size * self.window_size, self.window_size * self.window_size, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+        
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    """Transformer encoder block for global context modeling"""
+    
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1, use_windowed=False, window_size=7):
+        super(TransformerEncoder, self).__init__()
+        self.use_windowed = use_windowed
+        
+        self.norm1 = nn.LayerNorm(dim)
+        if use_windowed:
+            self.attn = WindowedAttention(dim, window_size, num_heads, dropout)
+        else:
+            self.attn = MultiHeadSelfAttention(dim, num_heads, dropout)
+        
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+        
+    def forward(self, x, H=None, W=None):
+        # Pre-norm architecture
+        if self.use_windowed:
+            x = x + self.attn(self.norm1(x), H, W)
+        else:
+            x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class GlobalContextModule(nn.Module):
+    """Global context module that adds self-attention after DDCM modules"""
+    
+    def __init__(self, in_channels, num_heads=8, num_layers=2, use_windowed=True, 
+                 window_size=7, dropout=0.1, pos_embed=True):
+        super(GlobalContextModule, self).__init__()
+        self.in_channels = in_channels
+        self.pos_embed = pos_embed
+        self.use_windowed = use_windowed
+        
+        # Adjust num_heads if it's larger than in_channels
+        num_heads = min(num_heads, in_channels)
+        if num_heads == 0:
+            num_heads = 1
+        
+        # Project channels to embedding dimension that's divisible by num_heads
+        embed_dim = max(in_channels, num_heads * ((in_channels + num_heads - 1) // num_heads))
+        self.input_proj = nn.Conv2d(in_channels, embed_dim, 1) if embed_dim != in_channels else nn.Identity()
+        self.embed_dim = embed_dim
+        
+        # Positional embedding
+        if pos_embed:
+            self.pos_embedding = nn.Parameter(torch.randn(1, 1024, embed_dim) * 0.02)
+        
+        # Transformer layers
+        self.transformer_layers = nn.ModuleList([
+            TransformerEncoder(embed_dim, num_heads, mlp_ratio=4.0, dropout=dropout, 
+                             use_windowed=use_windowed, window_size=window_size)
+            for _ in range(num_layers)
+        ])
+        
+        # Output projection back to original channels
+        self.output_proj = nn.Conv2d(embed_dim, in_channels, 1)
+        self.dropout = nn.Dropout2d(dropout)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        original_x = x
+        
+        # Input projection
+        x = self.input_proj(x)
+        embed_C = x.shape[1]
+        
+        # Flatten spatial dimensions for transformer
+        x_flat = x.flatten(2).transpose(1, 2)  # (B, H*W, embed_C)
+        
+        # Add positional embedding if enabled
+        if self.pos_embed and hasattr(self, 'pos_embedding'):
+            seq_len = x_flat.shape[1]
+            if seq_len <= self.pos_embedding.shape[1]:
+                x_flat = x_flat + self.pos_embedding[:, :seq_len, :]
+            else:
+                # Interpolate positional embedding for larger feature maps
+                pos_embed = F.interpolate(
+                    self.pos_embedding.transpose(1, 2),
+                    size=seq_len,
+                    mode='linear',
+                    align_corners=False
+                ).transpose(1, 2)
+                x_flat = x_flat + pos_embed
+        
+        # Apply transformer layers
+        for layer in self.transformer_layers:
+            if self.use_windowed:
+                x_flat = layer(x_flat, H, W)
+            else:
+                x_flat = layer(x_flat)
+        
+        # Reshape back to spatial format
+        x_out = x_flat.transpose(1, 2).reshape(B, embed_C, H, W)
+        
+        # Output projection and residual connection
+        x_out = self.output_proj(x_out)
+        x_out = self.dropout(x_out)
+        
+        return original_x + x_out  # Residual connection
+
+
+class DDCMNetEnhanced(nn.Module):
+    """Enhanced DDCM-Net with global context via self-attention"""
+    
+    def __init__(self, num_classes=6, backbone_name='resnet50', pretrained=True,
+                 use_global_context=True, global_context_config=None):
+        super(DDCMNetEnhanced, self).__init__()
+        
+        self.num_classes = num_classes
+        self.use_global_context = use_global_context
+        
+        # Default global context configuration
+        if global_context_config is None:
+            global_context_config = {
+                'num_heads': 8,
+                'num_layers': 2,
+                'use_windowed': True,
+                'window_size': 7,
+                'dropout': 0.1,
+                'pos_embed': True
+            }
+        
+        # Low-level encoder (same as original)
+        self.low_level_encoder = DDCMModule(
+            in_channels=3, base_channels=3, 
+            dilation_rates=[1, 2, 3, 5, 7, 9]
+        )
+        
+        # Low-level pooling
+        self.low_level_pool = nn.MaxPool2d(kernel_size=2)
+        
+        # Add global context after low-level encoder
+        if use_global_context:
+            self.low_level_global_context = GlobalContextModule(
+                in_channels=3, **global_context_config
+            )
+        
+        # Backbone (same as original)
+        self.backbone = ResNetBackbone(backbone_name, pretrained)
+        
+        # High-level decoders (same as original)
+        self.high_level_decoder1 = DDCMModule(
+            in_channels=1024, base_channels=36,
+            dilation_rates=[1, 2, 3, 4]
+        )
+        
+        # Add global context after first high-level decoder
+        if use_global_context:
+            self.high_level_global_context = GlobalContextModule(
+                in_channels=36, **global_context_config
+            )
+        
+        self.high_level_decoder2 = DDCMModule(
+            in_channels=36, base_channels=18,
+            dilation_rates=[1]
+        )
+        
+        # Fusion and classification (same as original)
+        self.classifier = nn.Conv2d(21, num_classes, kernel_size=3, padding=1)  # 3 + 18 = 21
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for newly added layers"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                if not any(backbone_module is m for backbone_module in self.backbone.modules()):
+                    nn.init.xavier_normal_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.PReLU):
+                nn.init.constant_(m.weight, 0.25)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        input_size = x.shape[2:]
+        
+        # Low-level features path with global context
+        low_features = self.low_level_encoder(x)
+        if self.use_global_context:
+            low_features = self.low_level_global_context(low_features)
+        
+        # Apply MaxPool2d
+        low_features = self.low_level_pool(low_features)
+        
+        # High-level features path with global context
+        high_features = self.backbone(x)
+        high_decoded1 = self.high_level_decoder1(high_features)
+        
+        if self.use_global_context:
+            high_decoded1 = self.high_level_global_context(high_decoded1)
+        
+        # Apply 4x upsampling (32 -> 128)
+        high_decoded1 = F.interpolate(
+            high_decoded1, scale_factor=4, 
+            mode='bilinear', align_corners=False
+        )
+        high_decoded2 = self.high_level_decoder2(high_decoded1)
+        
+        # Apply 2x upsampling to match low-level features (128 -> 256)
+        high_decoded2 = F.interpolate(
+            high_decoded2, scale_factor=2, 
+            mode='bilinear', align_corners=False
+        )
+        
+        # Both paths should be at half resolution for fusion
+        fused = torch.cat([low_features, high_decoded2], dim=1)
+        
+        # Final prediction 
+        x = self.classifier(fused)
+        
+        # Upsample back to original input size
+        return F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+
+
+def create_model(variant='base', num_classes=6, backbone='resnet50', pretrained=True, **kwargs):
+    """
+    Create DDCM-Net model variants
+    
+    Args:
+        variant (str): Model variant - 'base' for original DDCMNet, 'enhanced' for DDCMNetEnhanced
+        num_classes (int): Number of segmentation classes
+        backbone (str): Backbone architecture ('resnet50' or 'resnet101')
+        pretrained (bool): Use pretrained backbone weights
+        **kwargs: Additional arguments for enhanced model
+    
+    Returns:
+        torch.nn.Module: The requested model
+    """
+    if variant == 'base':
+        return DDCMNet(num_classes, backbone, pretrained)
+    elif variant == 'enhanced':
+        return DDCMNetEnhanced(num_classes, backbone, pretrained, **kwargs)
+    else:
+        raise ValueError(f"Unknown variant: {variant}. Choose 'base' or 'enhanced'")
 
 
 def create_trainer(model, device='auto', class_names=None):
