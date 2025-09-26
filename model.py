@@ -265,7 +265,7 @@ class DDCMTrainer:
         miou = np.mean(ious)
         return accuracy.item(), miou
     
-    def train_epoch(self, train_loader, optimizer, criterion):
+    def train_epoch(self, train_loader, optimizer, criterion, scheduler=None, use_batch_step=False):
         """Train for one epoch"""
         self.model.train()
         total_loss = 0
@@ -282,6 +282,10 @@ class DDCMTrainer:
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+            
+            # Update polynomial scheduler per batch if used
+            if use_batch_step and scheduler is not None:
+                scheduler.step()
             
             # Metrics
             acc, miou = self.compute_metrics(outputs, targets)
@@ -384,8 +388,10 @@ class DDCMTrainer:
         if lr_scheduler == 'poly':
             max_iter = epochs * len(train_loader)
             scheduler = PolynomialLR(optimizer, max_iter, power=0.9)
+            use_batch_step = True  # Poly scheduler steps per batch
         else:  # default: step
             scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
+            use_batch_step = False  # Step scheduler steps per epoch
         
         best_miou = 0
         
@@ -396,13 +402,14 @@ class DDCMTrainer:
             print(f"\nEpoch {epoch+1}/{epochs}")
             
             # Train
-            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion)
+            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion, scheduler, use_batch_step)
             
             # Validate
             val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
             
-            # Update scheduler
-            scheduler.step()
+            # Update scheduler (only for step scheduler, poly is updated per batch)
+            if not use_batch_step:
+                scheduler.step()
             
             # Save history
             self.history['train_loss'].append(train_loss)
@@ -500,8 +507,8 @@ class DDCMTrainer:
             print(f"\nEpoch {epoch+1}/{start_epoch + additional_epochs}")
             print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
             
-            # Train
-            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion)
+            # Train (continue_training always uses step scheduler, not poly)
+            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion, scheduler, False)
             
             # Validate  
             val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
@@ -612,10 +619,6 @@ class DDCMTrainer:
                     target = targets[i].cpu()
                     pred = predictions[i].cpu()
                     
-                    # Denormalize image
-                    mean = torch.tensor([0.485, 0.456, 0.406])
-                    std = torch.tensor([0.229, 0.224, 0.225])
-                    img = img * std[:, None, None] + mean[:, None, None]
                     img = torch.clamp(img, 0, 1)
                     
                     col = sample_count
