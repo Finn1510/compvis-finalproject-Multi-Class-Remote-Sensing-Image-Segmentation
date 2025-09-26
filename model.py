@@ -47,57 +47,76 @@ class PolynomialLR(torch.optim.lr_scheduler._LRScheduler):
                 for base_lr in self.base_lrs]
 
 
-class DCBlock(nn.Module):
-    """Dilated CNN-stack (DC) block with dense connections"""
-    
-    def __init__(self, in_channels, out_channels, dilation_rate=1, kernel_size=3, groups=1):
-        super(DCBlock, self).__init__()
-        
-        padding = dilation_rate * (kernel_size - 1) // 2
-        
-        self.dilated_conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size=kernel_size,
-            dilation=dilation_rate, padding=padding, groups=groups, bias=False
-        )
-        self.prelu = nn.PReLU()
-        self.bn = nn.BatchNorm2d(out_channels)
-    
-    def forward(self, x):
-        out = self.dilated_conv(x)
-        out = self.prelu(out)
-        out = self.bn(out)
-        return torch.cat([out, x], dim=1)
-
-
 class DDCMModule(nn.Module):
-    """Dense Dilated Convolutions Merging Module"""
+    """
+    Dense Dilated Convolutions Merging Module
     
-    def __init__(self, in_channels, base_channels=32, dilation_rates=[1, 2, 3, 5, 7, 9], groups=1):
+    This implementation follows the paper's approach where:
+    1. Each dilated convolution has growing input dimensions
+    2. Dense connections accumulate features from all previous layers
+    3. A final 1x1 convolution merges all accumulated features
+    """
+    
+    def __init__(self, in_channels, out_channels, dilation_rates=[1, 2, 3, 5, 7, 9], 
+                 kernel_size=3, bias=False, groups=1):
         super(DDCMModule, self).__init__()
         
-        self.dc_blocks = nn.ModuleList()
-        current_in_channels = in_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_layers = len(dilation_rates)
         
-        for dilation_rate in dilation_rates:
-            block = DCBlock(current_in_channels, base_channels, dilation_rate, groups=groups)
-            self.dc_blocks.append(block)
-            current_in_channels += base_channels
+        # Create dilated convolution layers with growing input dimensions
+        self.dilated_layers = nn.ModuleList()
         
-        # Merging layer
-        final_channels = in_channels + base_channels * len(dilation_rates)
-        self.merge_conv = nn.Conv2d(final_channels, base_channels, kernel_size=1, bias=False)
-        self.merge_bn = nn.BatchNorm2d(base_channels)
-        self.merge_prelu = nn.PReLU()
+        for idx, dilation_rate in enumerate(dilation_rates):
+            # Input channels grow with each layer: original + (idx * out_channels)
+            layer_in_channels = self.in_channels + idx * out_channels
+            padding = dilation_rate * (kernel_size - 1) // 2
+            
+            # Create the dilated convolution block
+            layer = nn.Sequential(
+                nn.Conv2d(
+                    layer_in_channels, 
+                    out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation_rate,
+                    padding=padding,
+                    bias=bias,
+                    groups=groups
+                ),
+                nn.PReLU(),
+                nn.BatchNorm2d(out_channels)
+            )
+            self.dilated_layers.append(layer)
+        
+        # Final merging layer - processes all accumulated features
+        final_in_channels = self.in_channels + out_channels * self.num_layers
+        self.merge_layer = nn.Sequential(
+            nn.Conv2d(final_in_channels, self.out_channels, kernel_size=1, bias=bias),
+            nn.PReLU(),
+            nn.BatchNorm2d(self.out_channels)
+        )
     
     def forward(self, x):
+        """
+        Forward pass with dense connections:
+        - Each layer receives input + all previous layer outputs
+        - Final layer merges all accumulated features
+        """
         current_input = x
-        for dc_block in self.dc_blocks:
-            current_input = dc_block(current_input)
         
-        out = self.merge_conv(current_input)
-        out = self.merge_prelu(out)
-        out = self.merge_bn(out)
-        return out
+        # Process through each dilated layer with dense connections
+        for dilated_layer in self.dilated_layers:
+            # Apply dilated convolution to current accumulated input
+            layer_output = dilated_layer(current_input)
+            
+            # Concatenate output with all previous features (dense connection)
+            current_input = torch.cat([layer_output, current_input], dim=1)
+        
+        # Apply final merging layer
+        output = self.merge_layer(current_input)
+        
+        return output
 
 
 class ResNetBackbone(nn.Module):
@@ -141,7 +160,8 @@ class DDCMNet(nn.Module):
         
         # Low-level encoder
         self.low_level_encoder = DDCMModule(
-            in_channels=3, base_channels=3, 
+            in_channels=3, 
+            out_channels=3, 
             dilation_rates=[1, 2, 3, 5, 7, 9]
         )
         
@@ -153,12 +173,14 @@ class DDCMNet(nn.Module):
         
         # High-level decoders
         self.high_level_decoder1 = DDCMModule(
-            in_channels=1024, base_channels=36,
+            in_channels=1024, 
+            out_channels=36,
             dilation_rates=[1, 2, 3, 4]
         )
         
         self.high_level_decoder2 = DDCMModule(
-            in_channels=36, base_channels=18,
+            in_channels=36, 
+            out_channels=18,
             dilation_rates=[1]
         )
         
@@ -997,7 +1019,8 @@ class DDCMNetEnhanced(nn.Module):
         
         # Low-level encoder (same as original)
         self.low_level_encoder = DDCMModule(
-            in_channels=3, base_channels=3, 
+            in_channels=3, 
+            out_channels=3, 
             dilation_rates=[1, 2, 3, 5, 7, 9]
         )
         
@@ -1015,7 +1038,8 @@ class DDCMNetEnhanced(nn.Module):
         
         # High-level decoders (same as original)
         self.high_level_decoder1 = DDCMModule(
-            in_channels=1024, base_channels=36,
+            in_channels=1024, 
+            out_channels=36,
             dilation_rates=[1, 2, 3, 4]
         )
         
@@ -1026,7 +1050,8 @@ class DDCMNetEnhanced(nn.Module):
             )
         
         self.high_level_decoder2 = DDCMModule(
-            in_channels=36, base_channels=18,
+            in_channels=36, 
+            out_channels=18,
             dilation_rates=[1]
         )
         

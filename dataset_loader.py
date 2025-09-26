@@ -387,7 +387,8 @@ def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compos
 
 def create_dataloaders(root_dir: str,
                       dataset: str = 'potsdam',
-                      patch_size: int = 256,
+                      train_patch_size: int = 256,
+                      val_patch_size: int = 448, 
                       batch_size: int = 16,
                       num_workers: int = 4,
                       pin_memory: bool = True,
@@ -399,7 +400,8 @@ def create_dataloaders(root_dir: str,
     Args:
         root_dir: Root directory for datasets
         dataset: 'potsdam', 'vaihingen', or 'both'
-        patch_size: Size of patches (default: 256)
+        train_patch_size: Size of patches for training (default: 256)
+        val_patch_size: Size of patches for validation/test (default: 448, as per paper)
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes
         pin_memory: Whether to use pinned memory for faster GPU transfer
@@ -413,12 +415,12 @@ def create_dataloaders(root_dir: str,
     train_transform, train_target_transform = get_transforms(is_training=True)
     val_transform, val_target_transform = get_transforms(is_training=False)
     
-    # Create datasets
+    # Create datasets with appropriate patch sizes
     train_dataset = PotsdamVaihingenDataset(
         root_dir=root_dir,
         dataset=dataset,
         split='train',
-        patch_size=patch_size,
+        patch_size=train_patch_size,
         transform=train_transform,
         target_transform=train_target_transform,
         augment=True
@@ -428,7 +430,7 @@ def create_dataloaders(root_dir: str,
         root_dir=root_dir,
         dataset=dataset,
         split='val',
-        patch_size=patch_size,
+        patch_size=val_patch_size,
         transform=val_transform,
         target_transform=val_target_transform,
         augment=False
@@ -438,7 +440,7 @@ def create_dataloaders(root_dir: str,
         root_dir=root_dir,
         dataset=dataset,
         split='test',
-        patch_size=patch_size,
+        patch_size=val_patch_size,
         transform=val_transform,
         target_transform=val_target_transform,
         augment=False
@@ -448,7 +450,7 @@ def create_dataloaders(root_dir: str,
         root_dir=root_dir,
         dataset=dataset,
         split='holdout',
-        patch_size=patch_size,
+        patch_size=val_patch_size,
         transform=val_transform,
         target_transform=val_target_transform,
         augment=False
@@ -460,7 +462,7 @@ def create_dataloaders(root_dir: str,
         batch_size=batch_size,
         shuffle=True,                    # Essential for training: randomizes batch composition
         num_workers=num_workers,
-        pin_memory=pin_memory,          # Faster GPU transfer
+        pin_memory=pin_memory,          
         drop_last=drop_last,            # Ensures consistent batch sizes for training
         worker_init_fn=worker_init_fn   # Ensures different seeds for each worker
     )
@@ -502,7 +504,8 @@ if __name__ == "__main__":
     train_loader, val_loader, test_loader, holdout_loader = create_dataloaders(
         root_dir=root_dir,
         dataset='potsdam',  # or 'vaihingen' or 'both'
-        patch_size=256,
+        train_patch_size=256,
+        val_patch_size=448,
         batch_size=8,
         num_workers=2
     )
