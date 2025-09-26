@@ -9,6 +9,31 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+class AverageMeter(object):
+    """Computes and stores the average and current value with pixel-weighted averaging"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def adjust_learning_rate(optimizer, curr_iter, initial_lr, max_iter, power=0.9):
+    """Polynomial learning rate decay per iteration"""
+    lr = initial_lr * (1 - curr_iter / max_iter) ** power
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
 class PolynomialLR(torch.optim.lr_scheduler._LRScheduler):
     """Polynomial learning rate decay scheduler"""
     
@@ -265,17 +290,18 @@ class DDCMTrainer:
         miou = np.mean(ious)
         return accuracy.item(), miou
     
-    def train_epoch(self, train_loader, optimizer, criterion, scheduler=None, use_batch_step=False):
-        """Train for one epoch"""
+    def train_epoch(self, train_loader, optimizer, criterion, scheduler=None, use_batch_step=False, 
+                   use_dual_lr=False, curr_iter=0, initial_lr=6.01e-5, max_iter=None):
+        """Train for one epoch with pixel-weighted averaging and optional dual LR scheduling"""
         self.model.train()
-        total_loss = 0
-        total_acc = 0
-        total_miou = 0
-        num_batches = 0
+        train_loss_meter = AverageMeter()
+        train_acc_meter = AverageMeter()
+        train_miou_meter = AverageMeter()
         
         pbar = tqdm(train_loader, desc='Training', leave=False)
         for images, targets in pbar:
             images, targets = images.to(self.device), targets.to(self.device)
+            N = images.size(0) * images.size(2) * images.size(3)  # Total pixels (B × H × W)
             
             optimizer.zero_grad()
             outputs = self.model(images)
@@ -283,38 +309,43 @@ class DDCMTrainer:
             loss.backward()
             optimizer.step()
             
-            # Update polynomial scheduler per batch if used
-            if use_batch_step and scheduler is not None:
+            # Dual LR scheduling: per-iteration polynomial decay
+            if use_dual_lr and max_iter is not None:
+                adjust_learning_rate(optimizer, curr_iter, initial_lr, max_iter)
+                curr_iter += 1
+            
+            # Update polynomial scheduler per batch if used (single LR mode)
+            if use_batch_step and scheduler is not None and not use_dual_lr:
                 scheduler.step()
             
             # Metrics
             acc, miou = self.compute_metrics(outputs, targets)
             
-            total_loss += loss.item()
-            total_acc += acc
-            total_miou += miou
-            num_batches += 1
+            # Pixel-weighted averaging
+            train_loss_meter.update(loss.item(), N)
+            train_acc_meter.update(acc, N)
+            train_miou_meter.update(miou, N)
             
             pbar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'Acc': f'{acc:.3f}',
-                'mIoU': f'{miou:.3f}'
+                'Loss': f'{train_loss_meter.avg:.4f}',
+                'Acc': f'{train_acc_meter.avg:.3f}',
+                'mIoU': f'{train_miou_meter.avg:.3f}'
             })
         
-        return total_loss/num_batches, total_acc/num_batches, total_miou/num_batches
+        return train_loss_meter.avg, train_acc_meter.avg, train_miou_meter.avg, curr_iter
     
     def validate_epoch(self, val_loader, criterion):
-        """Validate for one epoch"""
+        """Validate for one epoch with pixel-weighted averaging"""
         self.model.eval()
-        total_loss = 0
-        total_acc = 0
-        total_miou = 0
-        num_batches = 0
+        val_loss_meter = AverageMeter()
+        val_acc_meter = AverageMeter()
+        val_miou_meter = AverageMeter()
         
         with torch.no_grad():
             pbar = tqdm(val_loader, desc='Validation', leave=False)
             for images, targets in pbar:
                 images, targets = images.to(self.device), targets.to(self.device)
+                N = images.size(0) * images.size(2) * images.size(3)  # Total pixels (B × H × W)
                 
                 outputs = self.model(images)
                 loss = criterion(outputs, targets)
@@ -322,21 +353,21 @@ class DDCMTrainer:
                 # Metrics
                 acc, miou = self.compute_metrics(outputs, targets)
                 
-                total_loss += loss.item()
-                total_acc += acc
-                total_miou += miou
-                num_batches += 1
+                # Pixel-weighted averaging
+                val_loss_meter.update(loss.item(), N)
+                val_acc_meter.update(acc, N)
+                val_miou_meter.update(miou, N)
                 
                 pbar.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Acc': f'{acc:.3f}',
-                    'mIoU': f'{miou:.3f}'
+                    'Loss': f'{val_loss_meter.avg:.4f}',
+                    'Acc': f'{val_acc_meter.avg:.3f}',
+                    'mIoU': f'{val_miou_meter.avg:.3f}'
                 })
         
-        return total_loss/num_batches, total_acc/num_batches, total_miou/num_batches
+        return val_loss_meter.avg, val_acc_meter.avg, val_miou_meter.avg
     
     def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, 
-            class_weights=None, use_mfb=True, lr_scheduler='step'):
+            class_weights=None, use_mfb=True, lr_scheduler='step', use_dual_lr=False):
         """
         Train the model using best practices from the DDCM-Net paper:
         - Adam optimizer with AMSGrad
@@ -344,10 +375,13 @@ class DDCMTrainer:
         - Learning rate 8.5e-5/√2 ≈ 6.01e-5 for weights, 2x for biases
         - StepLR schedule: 0.85 decay every 15 epochs (default)
         - Alternative: Polynomial decay with power 0.9
+        - Dual LR scheduling: per-iteration polynomial + per-epoch StepLR
         - Cross-entropy loss with median frequency balancing (MFB)
+        - Pixel-weighted averaging (matches paper implementation)
         
         Args:
             lr_scheduler: 'step' for StepLR (default) or 'poly' for polynomial decay
+            use_dual_lr: Enable dual LR scheduling (per-iteration + per-epoch)
         """
         # Compute median frequency balancing weights if requested and not provided
         if use_mfb and class_weights is None:
@@ -384,8 +418,17 @@ class DDCMTrainer:
         
         optimizer = torch.optim.Adam(param_groups, amsgrad=True)
         
+        # Initialize iteration counter
+        curr_iter = 0
+        
         # Setup learning rate scheduler
-        if lr_scheduler == 'poly':
+        if use_dual_lr:
+            # Dual LR scheduling: per-iteration polynomial + per-epoch StepLR
+            max_iter = epochs * len(train_loader)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
+            use_batch_step = False
+            print("Using dual LR scheduling: per-iteration polynomial + per-epoch StepLR")
+        elif lr_scheduler == 'poly':
             max_iter = epochs * len(train_loader)
             scheduler = PolynomialLR(optimizer, max_iter, power=0.9)
             use_batch_step = True  # Poly scheduler steps per batch
@@ -397,18 +440,32 @@ class DDCMTrainer:
         
         print(f"Training on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        if use_dual_lr:
+            print(f"Dual LR mode: per-iteration polynomial (lr={lr:.2e}) + per-epoch StepLR (γ=0.85, step=15)")
+        else:
+            print(f"Single LR mode: {lr_scheduler} scheduler")
+        print("Using pixel-weighted averaging")
         
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}")
             
-            # Train
-            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion, scheduler, use_batch_step)
+            # Train with dual LR support
+            if use_dual_lr:
+                train_loss, train_acc, train_miou, curr_iter = self.train_epoch(
+                    train_loader, optimizer, criterion, scheduler, use_batch_step,
+                    use_dual_lr=True, curr_iter=curr_iter, initial_lr=lr, 
+                    max_iter=epochs * len(train_loader)
+                )
+            else:
+                train_loss, train_acc, train_miou, _ = self.train_epoch(
+                    train_loader, optimizer, criterion, scheduler, use_batch_step
+                )
             
             # Validate
             val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
             
-            # Update scheduler (only for step scheduler, poly is updated per batch)
-            if not use_batch_step:
+            # Update scheduler (StepLR per epoch, including in dual mode)
+            if not use_batch_step or use_dual_lr:
                 scheduler.step()
             
             # Save history
@@ -507,8 +564,8 @@ class DDCMTrainer:
             print(f"\nEpoch {epoch+1}/{start_epoch + additional_epochs}")
             print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
             
-            # Train (continue_training always uses step scheduler, not poly)
-            train_loss, train_acc, train_miou = self.train_epoch(train_loader, optimizer, criterion, scheduler, False)
+            # Train (continue_training always uses step scheduler, not poly or dual)
+            train_loss, train_acc, train_miou, _ = self.train_epoch(train_loader, optimizer, criterion, scheduler, False)
             
             # Validate  
             val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
