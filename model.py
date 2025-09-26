@@ -120,6 +120,9 @@ class DDCMNet(nn.Module):
             dilation_rates=[1, 2, 3, 5, 7, 9]
         )
         
+        # Low-level pooling
+        self.low_level_pool = nn.MaxPool2d(kernel_size=2)
+        
         # Backbone
         self.backbone = ResNetBackbone(backbone_name, pretrained)
         
@@ -142,9 +145,9 @@ class DDCMNet(nn.Module):
     def _init_weights(self):
         """Initialize weights for newly added layers"""
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
                 if not any(backbone_module is m for backbone_module in self.backbone.modules()):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    nn.init.xavier_normal_(m.weight)
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
@@ -156,13 +159,10 @@ class DDCMNet(nn.Module):
     def forward(self, x):
         input_size = x.shape[2:]
         
-        # Low-level features path: Input -> DDCM -> 0.5 pool -> half resolution
+        # Low-level features path: Input -> DDCM -> MaxPool -> half resolution
         low_features = self.low_level_encoder(x)
-        # Apply 0.5 pooling as specified in the paper
-        low_features = F.interpolate(
-            low_features, scale_factor=0.5, 
-            mode='bilinear', align_corners=False
-        )
+        # Apply MaxPool2d
+        low_features = self.low_level_pool(low_features)
         
         # High-level features path: Input -> Backbone -> DDCM1 -> 4x up -> DDCM2 -> 2x up -> half resolution
         high_features = self.backbone(x)
