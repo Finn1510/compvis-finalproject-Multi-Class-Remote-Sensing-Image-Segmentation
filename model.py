@@ -792,8 +792,8 @@ class WindowedAttention(nn.Module):
         )
         
         # Get pair-wise relative position indices
-        coords_h = torch.arange(self.window_size)
-        coords_w = torch.arange(self.window_size)
+        coords_h = torch.arange(self.window_size, dtype=torch.long)
+        coords_w = torch.arange(self.window_size, dtype=torch.long)
         coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
         coords_flatten = torch.flatten(coords, 1)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
@@ -857,7 +857,8 @@ class WindowedAttention(nn.Module):
     
     def window_reverse(self, windows, window_size, H, W):
         """Reverse window partition"""
-        B = int(windows.shape[0] / (H * W / window_size / window_size))
+        num_windows = (H // window_size) * (W // window_size)
+        B = windows.shape[0] // num_windows
         x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
         return x
@@ -871,9 +872,11 @@ class WindowedAttention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
         
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].reshape(
+        flat_index = self.relative_position_index.view(-1)
+        relative_position_bias = torch.index_select(self.relative_position_bias_table, 0, flat_index).reshape(
             self.window_size * self.window_size, self.window_size * self.window_size, -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        relative_position_bias = relative_position_bias.to(attn.device)
         attn = attn + relative_position_bias.unsqueeze(0)
         
         attn = attn.softmax(dim=-1)
@@ -928,19 +931,29 @@ class GlobalContextModule(nn.Module):
         self.pos_embed = pos_embed
         self.use_windowed = use_windowed
         
-        # Adjust num_heads if it's larger than in_channels
+        # Ensure minimum embedding dimension for stability
+        min_embed_dim = 32
+        
+        # Adjust num_heads for small channels
+        if in_channels < 8:
+            num_heads = min(num_heads, 4)  # Reduce heads for very small channels
         num_heads = min(num_heads, in_channels)
         if num_heads == 0:
             num_heads = 1
         
-        # Project channels to embedding dimension that's divisible by num_heads
-        embed_dim = max(in_channels, num_heads * ((in_channels + num_heads - 1) // num_heads))
+        # Project channels to embedding dimension with minimum size
+        embed_dim = max(min_embed_dim, in_channels)
+        # Ensure divisible by num_heads
+        embed_dim = num_heads * ((embed_dim + num_heads - 1) // num_heads)
         self.input_proj = nn.Conv2d(in_channels, embed_dim, 1) if embed_dim != in_channels else nn.Identity()
         self.embed_dim = embed_dim
         
-        # Positional embedding
+        # Positional embedding - use 2D spatial structure
         if pos_embed:
-            self.pos_embedding = nn.Parameter(torch.randn(1, 1024, embed_dim) * 0.02)
+            # Store as spatial 2D embedding for proper interpolation
+            base_size = 32  # Base spatial size for positional embedding
+            self.pos_embedding = nn.Parameter(torch.randn(1, embed_dim, base_size, base_size) * 0.02)
+            self.base_pos_size = base_size
         
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
@@ -951,7 +964,11 @@ class GlobalContextModule(nn.Module):
         
         # Output projection back to original channels
         self.output_proj = nn.Conv2d(embed_dim, in_channels, 1)
-        self.dropout = nn.Dropout2d(dropout)
+        # Use regular Dropout instead of Dropout2d for small channel counts
+        if in_channels <= 8:
+            self.dropout = nn.Identity()  # Skip dropout for very small channels
+        else:
+            self.dropout = nn.Dropout2d(dropout)
         
     def forward(self, x):
         B, C, H, W = x.shape
@@ -966,18 +983,21 @@ class GlobalContextModule(nn.Module):
         
         # Add positional embedding if enabled
         if self.pos_embed and hasattr(self, 'pos_embedding'):
-            seq_len = x_flat.shape[1]
-            if seq_len <= self.pos_embedding.shape[1]:
-                x_flat = x_flat + self.pos_embedding[:, :seq_len, :]
-            else:
-                # Interpolate positional embedding for larger feature maps
-                pos_embed = F.interpolate(
-                    self.pos_embedding.transpose(1, 2),
-                    size=seq_len,
-                    mode='linear',
+            # 2D spatial interpolation to preserve spatial structure
+            if H != self.base_pos_size or W != self.base_pos_size:
+                # Interpolate 2D positional embedding to match spatial size
+                pos_embed_2d = F.interpolate(
+                    self.pos_embedding, 
+                    size=(H, W), 
+                    mode='bicubic', 
                     align_corners=False
-                ).transpose(1, 2)
-                x_flat = x_flat + pos_embed
+                )
+            else:
+                pos_embed_2d = self.pos_embedding
+            
+            # Convert to flattened format and add
+            pos_embed_flat = pos_embed_2d.flatten(2).transpose(1, 2)  # (1, H*W, embed_C)
+            x_flat = x_flat + pos_embed_flat
         
         # Apply transformer layers
         for layer in self.transformer_layers:
@@ -1062,21 +1082,39 @@ class DDCMNetEnhanced(nn.Module):
     
     def _init_weights(self):
         """Initialize weights for newly added layers"""
-        for m in self.modules():
+        # Get all backbone module IDs to avoid reinitializing them
+        backbone_modules = set(self.backbone.modules())
+        
+        for name, m in self.named_modules():
+            # Skip backbone modules entirely
+            if m in backbone_modules:
+                continue
+                
             if isinstance(m, nn.Conv2d):
-                if not any(backbone_module is m for backbone_module in self.backbone.modules()):
-                    nn.init.xavier_normal_(m.weight)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                # LayerNorm needs proper initialization with correct shape
+                if hasattr(m, 'weight') and m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.PReLU):
                 nn.init.constant_(m.weight, 0.25)
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Parameter):
+                # Handle positional embeddings and other parameters
+                if 'pos_embedding' in name:
+                    nn.init.trunc_normal_(m, std=0.02)
+                elif 'relative_position_bias_table' in name:
+                    nn.init.trunc_normal_(m, std=0.02)
     
     def forward(self, x):
         input_size = x.shape[2:]
@@ -1124,11 +1162,11 @@ def create_model(variant='base', num_classes=6, backbone='resnet50', pretrained=
     Create DDCM-Net model variants
     
     Args:
-        variant (str): Model variant - 'base' for original DDCMNet, 'enhanced' for DDCMNetEnhanced
+        variant (str): Model variant - 'base' or 'enhanced'
         num_classes (int): Number of segmentation classes
         backbone (str): Backbone architecture ('resnet50' or 'resnet101')
         pretrained (bool): Use pretrained backbone weights
-        **kwargs: Additional arguments for enhanced model
+        **kwargs: Additional arguments for enhanced models
     
     Returns:
         torch.nn.Module: The requested model
