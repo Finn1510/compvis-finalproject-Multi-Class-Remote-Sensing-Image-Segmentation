@@ -166,19 +166,21 @@ class PotsdamVaihingenDataset(Dataset):
                 
         return image_paths, label_paths
 
-    def _prepare_valid_images(self) -> Tuple[List[Tuple[str, str, int, int]], int]:
-        """Prepare valid images for dynamic patch sampling."""
+    def _prepare_valid_images(self) -> Tuple[List, int]:
+        """Prepare valid images for patch sampling - random for training, deterministic for validation/test."""
         
-        # Determine target number of patches based on paper specifications
-        target_patches = {
-            'train': 5000,   # Paper specification
-            'val': 1000,     # Smaller validation set
-            'test': 1000     # Test set for evaluation
-        }
+        if self.split == 'train':
+            return self._prepare_random_sampling()
+        else:
+            return self._prepare_deterministic_sampling()
+    
+    def _prepare_random_sampling(self) -> Tuple[List[Tuple[str, str, int, int, int, int]], int]:
+        """Prepare images for random patch sampling (training only)."""
         
-        num_patches = target_patches.get(self.split, 1000)
+        # Target patches for training
+        num_patches = 5000  # Paper specification
         
-        print(f"Preparing images for dynamic sampling of {num_patches} patches for {self.split} split...")
+        print(f"Preparing images for random sampling of {num_patches} patches for training...")
         
         # Collect valid image information for random sampling
         valid_images = []
@@ -189,11 +191,14 @@ class PotsdamVaihingenDataset(Dataset):
                     width, height = img.size
                 
                 # Check if image is large enough for patches
-                max_x = width - self.patch_size
-                max_y = height - self.patch_size
+                # Use fixed patch size
+                effective_patch_size = self.patch_size
+                max_x = width - effective_patch_size
+                max_y = height - effective_patch_size
                 
                 if max_x > 0 and max_y > 0:
-                    valid_images.append((img_path, lbl_path, max_x, max_y))
+                    # Store image dimensions along with paths
+                    valid_images.append((img_path, lbl_path, max_x, max_y, width, height))
                     
             except Exception as e:
                 print(f"Error processing {img_path}: {e}")
@@ -203,8 +208,59 @@ class PotsdamVaihingenDataset(Dataset):
             print("No valid images found for patch extraction!")
             return [], num_patches
         
-        print(f"Successfully prepared {len(valid_images)} images for dynamic patch sampling")
+        print(f"Successfully prepared {len(valid_images)} images for random patch sampling")
         return valid_images, num_patches
+    
+    def _prepare_deterministic_sampling(self) -> Tuple[List[Tuple[str, str, int, int, int, int]], int]:
+        """Prepare deterministic patch coordinates for validation/test sets."""
+        
+        print(f"Preparing deterministic patch sampling for {self.split} split...")
+        
+        # Use fixed patch size for validation/test
+        current_patch_size = self.patch_size
+        
+        # Create deterministic patches using grid sampling
+        patch_coords = []  # Will store (img_path, lbl_path, x, y, patch_size, img_idx)
+        
+        for img_idx, (img_path, lbl_path) in enumerate(zip(self.image_paths, self.label_paths)):
+            try:
+                # Load image to get dimensions
+                with Image.open(img_path) as img:
+                    width, height = img.size
+                
+                # Calculate grid parameters for systematic sampling
+                # Use stride of patch_size//2 for overlapping patches (common practice)
+                stride = current_patch_size // 2
+                
+                # Generate grid coordinates
+                x_coords = list(range(0, width - current_patch_size + 1, stride))
+                y_coords = list(range(0, height - current_patch_size + 1, stride))
+                
+                # Ensure we include the rightmost and bottommost patches
+                if x_coords[-1] < width - current_patch_size:
+                    x_coords.append(width - current_patch_size)
+                if y_coords[-1] < height - current_patch_size:
+                    y_coords.append(height - current_patch_size)
+                
+                # Create all patch coordinate combinations
+                for x in x_coords:
+                    for y in y_coords:
+                        patch_coords.append((img_path, lbl_path, x, y, current_patch_size, img_idx))
+                        
+                print(f"Image {img_idx + 1}: {len(x_coords)}x{len(y_coords)} = {len(x_coords)*len(y_coords)} patches")
+                        
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+                continue
+        
+        if not patch_coords:
+            print("No valid patches found for deterministic extraction!")
+            return [], 0
+        
+        total_patches = len(patch_coords)
+        print(f"Successfully prepared {total_patches} deterministic patches from {len(self.image_paths)} images")
+        
+        return patch_coords, total_patches
 
     def _rgb_to_class_mask(self, rgb_label: np.ndarray) -> np.ndarray:
         """Convert RGB label to class mask."""
@@ -221,25 +277,68 @@ class PotsdamVaihingenDataset(Dataset):
         return self.num_patches
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Note: Each call to __getitem__ provides uniform random sampling
+        if self.split == 'train':
+            return self._get_random_patch(idx)
+        else:
+            return self._get_deterministic_patch(idx)
+    
+    def _get_random_patch(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a random patch for training (ignores idx for true random sampling)."""
+        # Note: Each call provides uniform random sampling
         # The 'idx' parameter is ignored in favor of true random sampling
         # This ensures uniform random sampling across the entire dataset for each epoch
         
         # Randomly select an image from valid images (uniform sampling)
-        img_path, lbl_path, max_x, max_y = random.choice(self.valid_images)
+        img_info = random.choice(self.valid_images)
+        if len(img_info) == 6:  # New format with width/height
+            img_path, lbl_path, base_max_x, base_max_y, img_width, img_height = img_info
+        else:  # Legacy format for backward compatibility
+            img_path, lbl_path, base_max_x, base_max_y = img_info
+            # Estimate dimensions (this is less accurate but maintains compatibility)
+            img_width = base_max_x + self.patch_size
+            img_height = base_max_y + self.patch_size
+        
+        # Use fixed patch size
+        current_patch_size = self.patch_size
+        
+        # Calculate valid sampling region for current patch size
+        max_x = img_width - current_patch_size
+        max_y = img_height - current_patch_size
+        
+        # Ensure valid sampling region exists
+        if max_x < 0 or max_y < 0:
+            # Fall back to fixed patch size if current size doesn't fit
+            max_x = img_width - current_patch_size
+            max_y = img_height - current_patch_size
         
         # Randomly select patch position within the image
-        x = random.randint(0, max_x)
-        y = random.randint(0, max_y)
+        x = random.randint(0, max(0, max_x))
+        y = random.randint(0, max(0, max_y))
         
+        return self._load_patch(img_path, lbl_path, x, y, current_patch_size)
+    
+    def _get_deterministic_patch(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a deterministic patch for validation/test using the provided index."""
+        # For deterministic sampling, use the actual idx to get a specific patch
+        if idx >= len(self.valid_images):
+            raise IndexError(f"Index {idx} out of range for {len(self.valid_images)} patches")
+        
+        # Extract patch coordinates from pre-computed list
+        patch_info = self.valid_images[idx]
+        img_path, lbl_path, x, y, current_patch_size, img_idx = patch_info
+        
+        return self._load_patch(img_path, lbl_path, x, y, current_patch_size)
+    
+    def _load_patch(self, img_path: str, lbl_path: str, x: int, y: int, patch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load and process a patch from the given coordinates."""
         # Load image patch
         with Image.open(img_path) as img:
-            img_patch = img.crop((x, y, x + self.patch_size, y + self.patch_size))
+            img_patch = img.crop((x, y, x + patch_size, y + patch_size))
             img_patch = np.array(img_patch)
             
         # Load label patch  
         with Image.open(lbl_path) as lbl:
-            lbl_patch = lbl.crop((x, y, x + self.patch_size, y + self.patch_size))
+            lbl_patch = lbl.crop((x, y, x + patch_size, y + patch_size))
             lbl_patch = np.array(lbl_patch)
             
         # Convert RGB labels to class indices
@@ -250,7 +349,7 @@ class PotsdamVaihingenDataset(Dataset):
         img_tensor = transforms.ToTensor()(Image.fromarray(img_patch))
         lbl_tensor = torch.from_numpy(lbl_patch.astype(np.uint8))
         
-        # Apply synchronized augmentation if enabled
+        # Apply synchronized augmentation if enabled (only for training)
         if self.augment:
             # Random horizontal flip (mirroring) with probability 0.5
             if torch.rand(1) < 0.5:
@@ -372,6 +471,7 @@ def worker_init_fn(worker_id):
     worker_seed = (base_seed + worker_id) % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
 
 # TODO Refactor this
 def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compose], Optional[transforms.Compose]]:
@@ -500,7 +600,7 @@ def create_dataloaders(root_dir: str,
 if __name__ == "__main__":
     root_dir = "./data"
     
-    # Create dataloaders
+    # Create regular dataloaders
     train_loader, val_loader, test_loader, holdout_loader = create_dataloaders(
         root_dir=root_dir,
         dataset='potsdam',  # or 'vaihingen' or 'both'
@@ -513,13 +613,3 @@ if __name__ == "__main__":
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
     print(f"Test batches: {len(test_loader)}")
-    
-    # Test loading a batch
-    if len(train_loader) > 0:
-        for images, labels in train_loader:
-            print(f"Image batch shape: {images.shape}")
-            print(f"Label batch shape: {labels.shape}")
-            print(f"Image dtype: {images.dtype}")
-            print(f"Label dtype: {labels.dtype}")
-            print(f"Label unique values: {torch.unique(labels)}")
-            break
