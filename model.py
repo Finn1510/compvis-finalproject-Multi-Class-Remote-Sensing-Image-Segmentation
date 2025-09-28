@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -250,23 +251,59 @@ class DDCMTrainer:
         self.history = {
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
-            'train_miou': [], 'val_miou': []
+            'train_miou': [], 'val_miou': [],
+            'lr': []  # Learning rate tracking for enhanced training
         }
     
-    def compute_class_weights(self, dataloader, method='median_frequency'):
-        """Compute class weights for balancing"""
+    def compute_class_weights(self, dataloader, method='median_frequency', cache_params=None):
+        """Compute class weights for balancing with caching support
+        
+        Args:
+            dataloader: Training dataloader to compute weights from
+            method: Weight computation method ('median_frequency' only currently supported)
+            cache_params: Dict with keys like 'dataset', 'batch_size', 'patch_size' for cache filename
+        
+        Returns:
+            torch.Tensor: Class weights
+        """
         if method == 'median_frequency':
-            return self._compute_median_frequency_weights(dataloader)
+            return self._compute_median_frequency_weights(dataloader, cache_params)
         else:
             return None
     
-    def _compute_median_frequency_weights(self, dataloader):
-        """Compute median frequency balancing weights"""
-        print("Computing median frequency balancing weights...")
+    def _compute_median_frequency_weights(self, dataloader, cache_params=None):
+        """Compute median frequency balancing weights with caching"""
+        # Generate cache filename based on parameters
+        if cache_params:
+            dataset = cache_params.get('dataset', 'unknown')
+            batch_size = cache_params.get('batch_size', 0)
+            patch_size = cache_params.get('patch_size', 0)
+            cache_file = f'class_weights_{dataset}_{batch_size}_{patch_size}.pt'
+        else:
+            # Fallback cache file if no params provided
+            cache_file = 'class_weights_default.pt'
+        
+        # Try to load from cache first
+        if os.path.exists(cache_file):
+            print(f"Loading cached class weights from {cache_file}...")
+            try:
+                weights = torch.load(cache_file, map_location=self.device, weights_only=True)
+                print("Class weights loaded from cache:")
+                for i, (name, weight) in enumerate(zip(self.class_names, weights)):
+                    print(f"  {i}: {name:<20} Weight: {weight:.3f}")
+                return weights
+            except Exception as e:
+                print(f"Error loading cache file {cache_file}: {e}")
+                print("Computing weights from scratch...")
+        else:
+            print("No cached weights found. Computing median frequency balancing weights...")
+        
+        # Compute weights from scratch
         class_counts = torch.zeros(self.model.num_classes)
         total_pixels = 0
         
-        for _, targets in tqdm(dataloader, desc="Computing class frequencies"):
+        print("Scanning training data for class distribution...")
+        for _, targets in tqdm(dataloader, desc="Computing class weights"):
             targets = targets.to(self.device)
             for class_id in range(self.model.num_classes):
                 class_counts[class_id] += (targets == class_id).sum().item()
@@ -276,12 +313,19 @@ class DDCMTrainer:
         frequencies = class_counts / total_pixels
         
         # Median frequency balancing: weight = median_freq / class_freq
-        median_freq = torch.median(frequencies)
+        median_freq = torch.median(frequencies[frequencies > 0])  # Avoid division by zero
         weights = median_freq / (frequencies + 1e-8)  # Add small epsilon to avoid division by zero
         
-        print(f"Class frequencies: {frequencies.numpy()}")
-        print(f"Median frequency: {median_freq:.6f}")
-        print(f"Class weights: {weights.numpy()}")
+        print("Class distribution and weights:")
+        for i, (name, freq, weight) in enumerate(zip(self.class_names, frequencies, weights)):
+            print(f"  {i}: {name:<20} Freq: {freq:.4f}, Weight: {weight:.3f}")
+        
+        # Cache the computed weights for future use
+        try:
+            print(f"Saving class weights to cache: {cache_file}")
+            torch.save(weights, cache_file)
+        except Exception as e:
+            print(f"Warning: Could not save cache file {cache_file}: {e}")
         
         return weights
     
@@ -389,7 +433,7 @@ class DDCMTrainer:
         return val_loss_meter.avg, val_acc_meter.avg, val_miou_meter.avg
     
     def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, 
-            class_weights=None, use_mfb=True, lr_scheduler='step', use_dual_lr=False):
+            class_weights=None, use_mfb=True, lr_scheduler='step', use_dual_lr=False, cache_params=None):
         """
         Train the model using best practices from the DDCM-Net paper:
         - Adam optimizer with AMSGrad
@@ -404,10 +448,11 @@ class DDCMTrainer:
         Args:
             lr_scheduler: 'step' for StepLR (default) or 'poly' for polynomial decay
             use_dual_lr: Enable dual LR scheduling (per-iteration + per-epoch)
+            cache_params: Dict with dataset info for caching class weights (e.g., {'dataset': 'potsdam', 'batch_size': 5, 'patch_size': 256})
         """
         # Compute median frequency balancing weights if requested and not provided
         if use_mfb and class_weights is None:
-            class_weights = self.compute_class_weights(train_loader, method='median_frequency')
+            class_weights = self.compute_class_weights(train_loader, method='median_frequency', cache_params=cache_params)
         
         # Setup parameter groups with different weight decay and learning rates
         weight_params = []
@@ -490,13 +535,15 @@ class DDCMTrainer:
             if not use_batch_step or use_dual_lr:
                 scheduler.step()
             
-            # Save history
+            # Save history including learning rate
+            current_lr = optimizer.param_groups[0]['lr']
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['train_acc'].append(train_acc)
             self.history['val_acc'].append(val_acc)
             self.history['train_miou'].append(train_miou)
             self.history['val_miou'].append(val_miou)
+            self.history['lr'].append(current_lr)
             
             # Print metrics
             print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.3f}, mIoU: {train_miou:.3f}")
@@ -511,120 +558,230 @@ class DDCMTrainer:
         print(f"\nTraining completed! Best mIoU: {best_miou:.3f}")
         return self.history
     
-    def continue_training(self, train_loader, val_loader, additional_epochs=20, 
-                         current_epoch=0, initial_lr=8.5e-5 / np.sqrt(2), weight_decay=2e-5):
+    def fit_enhanced(self, train_loader, val_loader, epochs=30, lr=1e-4, backbone_lr=1e-5, 
+                    weight_decay=1e-2, use_separate_backbone_lr=True, use_cosine_scheduler=True,
+                    use_gradient_clipping=True, grad_clip_max_norm=1.0, cache_params=None):
         """
-        Continue training from a checkpoint with proper learning rate schedule.
-        
         Args:
             train_loader: Training data loader
-            val_loader: Validation data loader  
-            additional_epochs: How many more epochs to train
-            current_epoch: The epoch number where previous training stopped
-            initial_lr: The initial learning rate used in original training
+            val_loader: Validation data loader
+            epochs: Number of training epochs
+            lr: Learning rate for new parameters
+            backbone_lr: Learning rate for backbone parameters (if use_separate_backbone_lr=True)
             weight_decay: Weight decay parameter
+            use_separate_backbone_lr: Use different LR for backbone vs new parameters
+            use_cosine_scheduler: Use cosine annealing LR scheduler
+            use_gradient_clipping: Enable gradient clipping
+            grad_clip_max_norm: Max norm for gradient clipping
+            cache_params: Dict with dataset info for caching class weights
         
         Returns:
-            Updated training history dictionary
+            Dict: Training history with losses, accuracies, mIoUs, and learning rates
         """
-        # Calculate current learning rate based on StepLR schedule (decay 0.85 every 15 epochs)
-        # LR = initial_lr * (0.85 ** (current_epoch // 15))
-        decay_factor = 0.85 ** (current_epoch // 15)
-        current_lr = initial_lr * decay_factor
+        print("=== Enhanced Training with Advanced Optimizer ===")
         
-        print(f"Resuming training from epoch {current_epoch + 1}")
-        print(f"Initial LR was: {initial_lr:.2e}")
-        print(f"Current LR will be: {current_lr:.2e} (decay factor: {decay_factor:.4f})")
-        print(f"Training for {additional_epochs} more epochs")
-        
-        # Setup parameter groups with current learning rate
-        weight_params = []
-        bias_params = []
-        bn_params = []
-        
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
+        if use_separate_backbone_lr:
+            # Identify backbone parameters
+            backbone_params = []
+            new_params = []
             
-            if 'bias' in name:
-                bias_params.append(param)
-            elif 'bn' in name or 'norm' in name:
-                bn_params.append(param)
-            else:
-                weight_params.append(param)
-        
-        # Parameter groups: weights with weight decay, biases with 2x LR, batch-norm without weight decay
-        param_groups = [
-            {'params': weight_params, 'lr': current_lr, 'weight_decay': weight_decay},
-            {'params': bias_params, 'lr': 2 * current_lr, 'weight_decay': 0.0},
-            {'params': bn_params, 'lr': current_lr, 'weight_decay': 0.0}
-        ]
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                
+                # Check if parameter belongs to backbone
+                if 'backbone' in name or 'encoder' in name or 'resnet' in name.lower():
+                    backbone_params.append(param)
+                else:
+                    new_params.append(param)
+            
+            # Create parameter groups
+            param_groups = [
+                {'params': backbone_params, 'lr': backbone_lr, 'weight_decay': weight_decay},
+                {'params': new_params, 'lr': lr, 'weight_decay': weight_decay}
+            ]
+            
+        else:
+            param_groups = [{'params': self.model.parameters(), 'lr': lr, 'weight_decay': weight_decay}]
         
         # Setup optimizer and scheduler
-        optimizer = torch.optim.Adam(param_groups, amsgrad=True)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
         
-        # Create scheduler starting from current epoch
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
+        if use_cosine_scheduler:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+            print(f"Using CosineAnnealingLR scheduler with T_max={epochs}")
+        else:
+            scheduler = None
+            print("No scheduler will be used")
         
-        # Advance scheduler to current position
-        for _ in range(current_epoch):
-            scheduler.step()
+        print(f"\nGradient clipping: {'Enabled' if use_gradient_clipping else 'Disabled'}")
+        if use_gradient_clipping:
+            print(f"  Max norm: {grad_clip_max_norm}")
         
-        # Setup loss function (recompute class weights if using MFB)
-        print("Computing class weights for continued training...")
-        class_weights = self.compute_class_weights(train_loader, method='median_frequency')
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=self.device))
+        # Setup loss function with cached class weights
+        class_weights = self.compute_class_weights(train_loader, method='median_frequency', cache_params=cache_params)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         
-        # Track best mIoU from previous training
-        best_miou = max(self.history['val_miou']) if self.history['val_miou'] else 0
-        print(f"Previous best mIoU: {best_miou:.3f}")
+        # Reset history for this training session
+        self.history = {
+            'train_loss': [], 'val_loss': [],
+            'train_acc': [], 'val_acc': [],
+            'train_miou': [], 'val_miou': [],
+            'lr': []
+        }
         
-        # Continue training loop
-        start_epoch = len(self.history['train_loss'])
+        best_val_miou = 0.0
         
-        for epoch in range(start_epoch, start_epoch + additional_epochs):
-            print(f"\nEpoch {epoch+1}/{start_epoch + additional_epochs}")
-            print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
+        print(f"\nConfiguration:")
+        print(f"  Epochs: {epochs}")
+        print(f"  Learning rate(s): {lr:.2e}" + (f" (backbone: {backbone_lr:.2e})" if use_separate_backbone_lr else ""))
+        print(f"  Weight decay: {weight_decay}")
+        print(f"  Device: {self.device}")
+        print(f"\nStarting enhanced training loop...")
+        
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}")
             
-            # Train (continue_training always uses step scheduler, not poly or dual)
-            train_loss, train_acc, train_miou, _ = self.train_epoch(train_loader, optimizer, criterion, scheduler, False)
+            # Training phase
+            self.model.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            train_intersection = torch.zeros(self.model.num_classes).to(self.device)
+            train_union = torch.zeros(self.model.num_classes).to(self.device)
             
-            # Validate  
-            val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
+            pbar = tqdm(train_loader, desc=f'Training Epoch {epoch+1}')
+            for batch_idx, (images, targets) in enumerate(pbar):
+                images, targets = images.to(self.device), targets.to(self.device)
+                
+                optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = criterion(outputs, targets)
+                
+                loss.backward()
+                
+                if use_gradient_clipping:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_max_norm)
+                
+                optimizer.step()
+                
+                # Compute metrics
+                train_loss += loss.item()
+                predictions = torch.argmax(outputs, dim=1)
+                train_correct += (predictions == targets).sum().item()
+                train_total += targets.numel()
+                
+                # Compute per-class IoU
+                for class_id in range(self.model.num_classes):
+                    pred_mask = (predictions == class_id)
+                    true_mask = (targets == class_id)
+                    intersection = (pred_mask & true_mask).sum()
+                    union = (pred_mask | true_mask).sum()
+                    
+                    train_intersection[class_id] += intersection
+                    train_union[class_id] += union
+                
+                current_lr = optimizer.param_groups[0]['lr']
+                pbar.set_postfix({
+                    'Loss': f"{loss.item():.4f}",
+                    'LR': f"{current_lr:.2e}"
+                })
             
-            # Update scheduler
-            scheduler.step()
+            # Calculate epoch metrics
+            epoch_train_loss = train_loss / len(train_loader)
+            epoch_train_acc = train_correct / train_total
             
-            # Save history
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['train_acc'].append(train_acc)
-            self.history['val_acc'].append(val_acc)
-            self.history['train_miou'].append(train_miou)
-            self.history['val_miou'].append(val_miou)
+            # Calculate mIoU
+            train_ious = train_intersection / (train_union + 1e-8)
+            train_ious = train_ious[train_union > 0]  # Only consider classes that appear in training
+            epoch_train_miou = train_ious.mean().item()
             
-            # Print metrics
-            print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.3f}, mIoU: {train_miou:.3f}")
-            print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.3f}, mIoU: {val_miou:.3f}")
+            # Validation phase
+            self.model.eval()
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
+            val_intersection = torch.zeros(self.model.num_classes).to(self.device)
+            val_union = torch.zeros(self.model.num_classes).to(self.device)
+            
+            with torch.no_grad():
+                for images, targets in tqdm(val_loader, desc=f'Validation Epoch {epoch+1}'):
+                    images, targets = images.to(self.device), targets.to(self.device)
+                    
+                    outputs = self.model(images)
+                    loss = criterion(outputs, targets)
+                    
+                    val_loss += loss.item()
+                    predictions = torch.argmax(outputs, dim=1)
+                    val_correct += (predictions == targets).sum().item()
+                    val_total += targets.numel()
+                    
+                    # Compute per-class IoU
+                    for class_id in range(self.model.num_classes):
+                        pred_mask = (predictions == class_id)
+                        true_mask = (targets == class_id)
+                        intersection = (pred_mask & true_mask).sum()
+                        union = (pred_mask | true_mask).sum()
+                        
+                        val_intersection[class_id] += intersection
+                        val_union[class_id] += union
+            
+            # Calculate validation metrics
+            epoch_val_loss = val_loss / len(val_loader)
+            epoch_val_acc = val_correct / val_total
+            
+            val_ious = val_intersection / (val_union + 1e-8)
+            val_ious = val_ious[val_union > 0]
+            epoch_val_miou = val_ious.mean().item()
+            
+            # Update learning rate
+            if use_cosine_scheduler and scheduler is not None:
+                scheduler.step()
+            
+            # Store history including learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            self.history['train_loss'].append(epoch_train_loss)
+            self.history['val_loss'].append(epoch_val_loss)
+            self.history['train_acc'].append(epoch_train_acc)
+            self.history['val_acc'].append(epoch_val_acc)
+            self.history['train_miou'].append(epoch_train_miou)
+            self.history['val_miou'].append(epoch_val_miou)
+            self.history['lr'].append(current_lr)
+            
+            # Print epoch results
+            print(f"Results:")
+            print(f"  Train - Loss: {epoch_train_loss:.4f}, Acc: {epoch_train_acc:.3f}, mIoU: {epoch_train_miou:.3f}")
+            print(f"  Val   - Loss: {epoch_val_loss:.4f}, Acc: {epoch_val_acc:.3f}, mIoU: {epoch_val_miou:.3f}")
+            print(f"  LR: {current_lr:.2e}")
             
             # Save best model
-            if val_miou > best_miou:
-                best_miou = val_miou
-                self.save_model('best_model.pth')
-                print(f"New best model saved! mIoU: {best_miou:.3f}")
+            if epoch_val_miou > best_val_miou:
+                best_val_miou = epoch_val_miou
+                self.save_model('best_enhanced_model.pth')
+                print(f"  ✓ New best model saved! (mIoU: {best_val_miou:.4f})")
         
-        print(f"\nContinued training completed! Final best mIoU: {best_miou:.3f}")
+        print(f"\nEnhanced training completed!")
+        print(f"Best validation mIoU: {best_val_miou:.4f}")
+        print("Enhanced model saved as 'best_enhanced_model.pth'")
+        
         return self.history
     
     def plot_training_history(self, figsize=(15, 5)):
-        """Plot training history"""
+        """Plot training history with optional learning rate visualization"""
         if not self.history['train_loss']:
             print("No training history to plot")
             return
         
         epochs = range(1, len(self.history['train_loss']) + 1)
         
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        # Check if learning rate data is available
+        has_lr_data = 'lr' in self.history and len(self.history['lr']) == len(self.history['train_loss'])
+        
+        if has_lr_data:
+            fig, axes = plt.subplots(2, 2, figsize=(figsize[0], figsize[1] * 1.3))
+            axes = axes.flatten()
+        else:
+            fig, axes = plt.subplots(1, 3, figsize=figsize)
         
         # Loss
         axes[0].plot(epochs, self.history['train_loss'], 'b-', label='Train', linewidth=2)
@@ -652,6 +809,15 @@ class DDCMTrainer:
         axes[2].set_ylabel('mIoU')
         axes[2].legend()
         axes[2].grid(True, alpha=0.3)
+        
+        # Learning rate (if available)
+        if has_lr_data:
+            axes[3].plot(epochs, self.history['lr'], 'g-', linewidth=2)
+            axes[3].set_title('Learning Rate')
+            axes[3].set_xlabel('Epoch')
+            axes[3].set_ylabel('Learning Rate')
+            axes[3].set_yscale('log')  # Log scale for better visualization
+            axes[3].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.show()
