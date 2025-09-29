@@ -53,6 +53,7 @@ class PotsdamVaihingenDataset(Dataset):
                  dataset: str = 'potsdam',
                  split: str = 'train',
                  patch_size: int = 256,
+                 num_training_patches: int = 5000,
                  transform: Optional[transforms.Compose] = None,
                  target_transform: Optional[transforms.Compose] = None,
                  augment: bool = True):
@@ -70,6 +71,7 @@ class PotsdamVaihingenDataset(Dataset):
         self.dataset = dataset.lower()
         self.split = split
         self.patch_size = patch_size
+        self.num_training_patches = num_training_patches
         self.transform = transform
         self.target_transform = target_transform
         self.augment = augment and (split == 'train')  # Only augment training data
@@ -178,7 +180,7 @@ class PotsdamVaihingenDataset(Dataset):
         """Prepare images for random patch sampling (training only)."""
         
         # Target patches for training
-        num_patches = 5000  # Paper specification
+        num_patches = self.num_training_patches
         
         print(f"Preparing images for random sampling of {num_patches} patches for training...")
         
@@ -229,8 +231,8 @@ class PotsdamVaihingenDataset(Dataset):
                     width, height = img.size
                 
                 # Calculate grid parameters for systematic sampling
-                # Use stride of patch_size//2 for overlapping patches (common practice)
-                stride = current_patch_size // 2
+                # Use non-overlapping patches for faster validation
+                stride = current_patch_size
                 
                 # Generate grid coordinates
                 x_coords = list(range(0, width - current_patch_size + 1, stride))
@@ -492,7 +494,8 @@ def create_dataloaders(root_dir: str,
                       batch_size: int = 16,
                       num_workers: int = 4,
                       pin_memory: bool = True,
-                      drop_last: bool = True
+                      drop_last: bool = True,
+                      num_training_patches: int = 5000
                       ) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders.
@@ -506,6 +509,7 @@ def create_dataloaders(root_dir: str,
         num_workers: Number of worker processes
         pin_memory: Whether to use pinned memory for faster GPU transfer
         drop_last: Whether to drop the last incomplete batch (recommended for training)
+        num_training_patches: Number of random patches to generate per training epoch (default: 5000)
         
     Returns:
         Tuple of (train_loader, val_loader, test_loader, holdout_loader)
@@ -521,6 +525,7 @@ def create_dataloaders(root_dir: str,
         dataset=dataset,
         split='train',
         patch_size=train_patch_size,
+        num_training_patches=num_training_patches,
         transform=train_transform,
         target_transform=train_target_transform,
         augment=True
@@ -607,7 +612,8 @@ if __name__ == "__main__":
         train_patch_size=256,
         val_patch_size=448,
         batch_size=8,
-        num_workers=2
+        num_workers=2,
+        num_training_patches=5000  # Configurable training patches per epoch
     )
     
     print(f"Train batches: {len(train_loader)}")

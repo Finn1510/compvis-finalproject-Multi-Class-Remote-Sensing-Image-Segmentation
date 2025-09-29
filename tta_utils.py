@@ -110,7 +110,6 @@ class TTAPredictor:
         count_canvas = torch.zeros(batch_size, 1, height, width, device=self.device)
         
         print(f"Applying TTA with {patch_size}×{patch_size} patches, stride={stride}")
-        print(f"Image size: {height}×{width}")
         
         # Calculate positions for sliding windows (ensuring full coverage)
         y_positions = []
@@ -266,16 +265,12 @@ class TTAEvaluator:
         # Convert predictions to class labels
         tta_pred_labels = torch.argmax(tta_prediction, dim=1)[0].cpu()
         
-        # Denormalize image for visualization
         if original_image.dim() == 4:
             img = original_image[0]
         else:
             img = original_image
             
-        mean = torch.tensor([0.485, 0.456, 0.406])
-        std = torch.tensor([0.229, 0.224, 0.225])
-        img_denorm = img * std[:, None, None] + mean[:, None, None]
-        img_denorm = torch.clamp(img_denorm, 0, 1)
+        img = img.permute(1, 2, 0).cpu().numpy()
         
         # Create visualization
         if regular_prediction is not None:
@@ -289,7 +284,7 @@ class TTAEvaluator:
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
         # Original image
-        axes[0].imshow(img_denorm.permute(1, 2, 0))
+        axes[0].imshow(img)
         axes[0].set_title('Original Image')
         axes[0].axis('off')
         
@@ -337,7 +332,7 @@ class TTAEvaluator:
         return accuracy, mean_iou, class_ious
     
     def evaluate_model_with_tta(self, model, test_loader, model_name="Model", 
-                               max_images=None, visualize=True, patch_size=448, stride=100):
+                               max_images=None, visualize=True, patch_size=448, stride=100, crop_large_images=True):
         """
         Comprehensive evaluation of a model with TTA
         
@@ -368,8 +363,6 @@ class TTAEvaluator:
             available_images = available_images[:max_images]
             print(f"Processing {max_images} images for demonstration")
         
-        print(f"Total images to process: {len(available_images)}")
-        
         # Initialize metrics storage
         all_tta_accuracies = []
         all_reg_accuracies = []
@@ -385,11 +378,9 @@ class TTAEvaluator:
             try:
                 # Load full-resolution image and label
                 full_image, full_label = test_dataset.get_full_image(img_idx)
-                print(f"  Image shape: {full_image.shape}")
-                
-                # Crop large images for faster processing
+
                 _, _, height, width = full_image.shape
-                if height > 1500 or width > 1500:
+                if crop_large_images and (height > 1500 or width > 1500):
                     print(f"  Cropping large image ({height}×{width}) to 1500×1500")
                     crop_h = min(1500, height)
                     crop_w = min(1500, width)
@@ -484,7 +475,7 @@ class TTAEvaluator:
             return None
     
     def compare_models_with_tta(self, models_dict, test_loader, max_images=None, 
-                               visualize=False, patch_size=448, stride=100):
+                               visualize=False, patch_size=448, stride=100, crop_large_images=True):
         """
         Compare multiple models using TTA
         
@@ -509,7 +500,7 @@ class TTAEvaluator:
         for model_name, model in models_dict.items():
             results = self.evaluate_model_with_tta(
                 model, test_loader, model_name, max_images, 
-                visualize, patch_size, stride
+                visualize, patch_size, stride, crop_large_images
             )
             if results:
                 all_results[model_name] = results

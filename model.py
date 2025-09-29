@@ -479,7 +479,10 @@ class DDCMTrainer:
         
         # Setup loss function with class weights if provided
         if class_weights is not None:
-            criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=self.device))
+            if isinstance(class_weights, torch.Tensor):
+                criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+            else:
+                criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=self.device))
         else:
             criterion = nn.CrossEntropyLoss()
         
@@ -578,8 +581,6 @@ class DDCMTrainer:
         Returns:
             Dict: Training history with losses, accuracies, mIoUs, and learning rates
         """
-        print("=== Enhanced Training with Advanced Optimizer ===")
-        
         if use_separate_backbone_lr:
             # Identify backbone parameters
             backbone_params = []
@@ -609,18 +610,15 @@ class DDCMTrainer:
         
         if use_cosine_scheduler:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-            print(f"Using CosineAnnealingLR scheduler with T_max={epochs}")
         else:
             scheduler = None
-            print("No scheduler will be used")
-        
-        print(f"\nGradient clipping: {'Enabled' if use_gradient_clipping else 'Disabled'}")
-        if use_gradient_clipping:
-            print(f"  Max norm: {grad_clip_max_norm}")
         
         # Setup loss function with cached class weights
         class_weights = self.compute_class_weights(train_loader, method='median_frequency', cache_params=cache_params)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        if class_weights is not None:
+            criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+        else:
+            criterion = nn.CrossEntropyLoss()
         
         # Reset history for this training session
         self.history = {
@@ -758,7 +756,7 @@ class DDCMTrainer:
             if epoch_val_miou > best_val_miou:
                 best_val_miou = epoch_val_miou
                 self.save_model('best_enhanced_model.pth')
-                print(f"  ✓ New best model saved! (mIoU: {best_val_miou:.4f})")
+                print(f"New best model saved! (mIoU: {best_val_miou:.4f})")
         
         print(f"\nEnhanced training completed!")
         print(f"Best validation mIoU: {best_val_miou:.4f}")
@@ -908,40 +906,6 @@ class DDCMTrainer:
 
 # ==================== ENHANCED MODEL WITH SELF-ATTENTION ====================
 
-class MultiHeadSelfAttention(nn.Module):
-    """Multi-head self-attention module for global context modeling"""
-    
-    def __init__(self, dim, num_heads=8, dropout=0.1):
-        super(MultiHeadSelfAttention, self).__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        B, N, C = x.shape  # Batch, Num_patches, Channels
-        
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, num_heads, N, head_dim)
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_dropout(x)
-        
-        return x
-
-
 class WindowedAttention(nn.Module):
     """Windowed multi-head self-attention for efficient computation on high-res features"""
     
@@ -1057,15 +1021,11 @@ class WindowedAttention(nn.Module):
 class TransformerEncoder(nn.Module):
     """Transformer encoder block for global context modeling"""
     
-    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1, use_windowed=False, window_size=7):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1, window_size=7):
         super(TransformerEncoder, self).__init__()
-        self.use_windowed = use_windowed
         
         self.norm1 = nn.LayerNorm(dim)
-        if use_windowed:
-            self.attn = WindowedAttention(dim, window_size, num_heads, dropout)
-        else:
-            self.attn = MultiHeadSelfAttention(dim, num_heads, dropout)
+        self.attn = WindowedAttention(dim, window_size, num_heads, dropout)
         
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -1079,10 +1039,7 @@ class TransformerEncoder(nn.Module):
         
     def forward(self, x, H=None, W=None):
         # Pre-norm architecture
-        if self.use_windowed:
-            x = x + self.attn(self.norm1(x), H, W)
-        else:
-            x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), H, W)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -1090,12 +1047,11 @@ class TransformerEncoder(nn.Module):
 class GlobalContextModule(nn.Module):
     """Global context module that adds self-attention after DDCM modules"""
     
-    def __init__(self, in_channels, num_heads=8, num_layers=2, use_windowed=True, 
+    def __init__(self, in_channels, num_heads=8, num_layers=2, 
                  window_size=7, dropout=0.1, pos_embed=True):
         super(GlobalContextModule, self).__init__()
         self.in_channels = in_channels
         self.pos_embed = pos_embed
-        self.use_windowed = use_windowed
         
         # Ensure minimum embedding dimension for stability
         min_embed_dim = 32
@@ -1123,8 +1079,7 @@ class GlobalContextModule(nn.Module):
         
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
-            TransformerEncoder(embed_dim, num_heads, mlp_ratio=4.0, dropout=dropout, 
-                             use_windowed=use_windowed, window_size=window_size)
+            TransformerEncoder(embed_dim, num_heads, mlp_ratio=4.0, dropout=dropout, window_size=window_size)
             for _ in range(num_layers)
         ])
         
@@ -1167,10 +1122,7 @@ class GlobalContextModule(nn.Module):
         
         # Apply transformer layers
         for layer in self.transformer_layers:
-            if self.use_windowed:
-                x_flat = layer(x_flat, H, W)
-            else:
-                x_flat = layer(x_flat)
+            x_flat = layer(x_flat, H, W)
         
         # Reshape back to spatial format
         x_out = x_flat.transpose(1, 2).reshape(B, embed_C, H, W)
@@ -1192,13 +1144,11 @@ class DDCMNetEnhanced(nn.Module):
         self.num_classes = num_classes
         self.use_global_context = use_global_context
         
-        # Default global context configuration
         if global_context_config is None:
             global_context_config = {
-                'num_heads': 8,
+                'num_heads': 10,
                 'num_layers': 2,
-                'use_windowed': True,
-                'window_size': 7,
+                'window_size': 10,
                 'dropout': 0.1,
                 'pos_embed': True
             }
