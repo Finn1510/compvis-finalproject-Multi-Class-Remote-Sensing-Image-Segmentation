@@ -1,5 +1,13 @@
 # Computer Vision Final Project - Multi Class Remote Sensing Image Segmentation
 
+### File Overview
+- `DDCM_Net_Training_Demo.ipynb`: Main training notebook, refereces all implementations 
+- `model.py`: Model definitions 
+- `dataset_loader.py`: Data loading and preprocessing
+- `tta_utils.py` Test time augmentation implementation 
+
+## Setup
+
 ### 1. Install Dependencies
 
 ```bash
@@ -47,6 +55,7 @@ Both datasets contain 6 semantic classes:
 
 ### Dataset Splits
 Same as DDCM-Net paper:
+
 **Potsdam:**
 - Train: Areas 2_10, 2_11, 2_12, 3_10, 3_11, 3_12, 4_11, 4_12, 5_10, 5_12, 6_7, 6_8, 6_10, 6_11, 6_12, 7_7, 7_9, 7_8, 7_12
 - Local Test: Areas 5_11, 6_9, 7_11
