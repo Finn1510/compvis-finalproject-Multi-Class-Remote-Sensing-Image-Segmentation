@@ -202,37 +202,91 @@ class TTAPredictor:
         print("TTA inference completed!")
         return final_prediction
     
-    def predict_regular(self, image, max_size=1024):
+    def predict_regular(self, image, patch_size=448, stride=100):
         """
-        Regular prediction without TTA (for comparison)
+        Regular prediction using sliding window without TTA
         
         Args:
             image: Input image tensor [1, 3, H, W] or [3, H, W]
-            max_size: Maximum size for prediction to avoid memory issues
+            patch_size: Size of sliding window patches (default: 448)
+            stride: Stride for sliding window (default: 100)
         
         Returns:
             Prediction tensor [1, num_classes, H, W]
         """
         self.model.eval()
         
-        # Ensure input is 4D
+        # Ensure input is 4D [1, 3, H, W]
         if len(image.shape) == 3:
             image = image.unsqueeze(0)
         
-        _, _, h, w = image.shape
+        batch_size, channels, height, width = image.shape
         
-        with torch.no_grad():
-            if h > max_size or w > max_size:
-                # Resize for regular prediction
-                scale_factor = max_size / max(h, w)
-                resized_image = F.interpolate(image, scale_factor=scale_factor, mode='bilinear', align_corners=False)
-                prediction = self.model(resized_image.to(self.device))
-                # Resize back to original size
-                prediction = F.interpolate(prediction, size=(h, w), mode='bilinear', align_corners=False)
-            else:
-                prediction = self.model(image.to(self.device))
+        # Move to device
+        image = image.to(self.device)
         
-        return prediction
+        # For small images, use direct prediction
+        if height <= patch_size and width <= patch_size:
+            with torch.no_grad():
+                return self.model(image)
+        
+        # Initialize output canvas and count map for sliding window
+        prediction_canvas = torch.zeros(batch_size, self.num_classes, height, width, device=self.device)
+        count_canvas = torch.zeros(batch_size, 1, height, width, device=self.device)
+        
+        # Calculate positions for sliding windows (ensuring full coverage)
+        y_positions = []
+        x_positions = []
+        
+        # Generate y positions
+        for y in range(0, height - patch_size + 1, stride):
+            y_positions.append(y)
+        # Ensure we include the bottom edge
+        if y_positions and y_positions[-1] + patch_size < height:
+            y_positions.append(height - patch_size)
+        elif not y_positions:
+            y_positions.append(0)
+        
+        # Generate x positions
+        for x in range(0, width - patch_size + 1, stride):
+            x_positions.append(x)
+        # Ensure we include the right edge
+        if x_positions and x_positions[-1] + patch_size < width:
+            x_positions.append(width - patch_size)
+        elif not x_positions:
+            x_positions.append(0)
+        
+        # Sliding window extraction and prediction
+        for y in y_positions:
+            for x in x_positions:
+                # Extract patch (handle edge cases)
+                y_end = min(y + patch_size, height)
+                x_end = min(x + patch_size, width)
+                patch = image[:, :, y:y_end, x:x_end]
+                
+                # Pad patch if needed (for edge cases)
+                if patch.shape[2] < patch_size or patch.shape[3] < patch_size:
+                    pad_h = patch_size - patch.shape[2]
+                    pad_w = patch_size - patch.shape[3]
+                    patch = F.pad(patch, (0, pad_w, 0, pad_h), mode='reflect')
+                
+                # Get model prediction (no TTA transformations)
+                with torch.no_grad():
+                    pred = self.model(patch)
+                
+                # Remove padding if it was added
+                if pred.shape[2] > (y_end - y) or pred.shape[3] > (x_end - x):
+                    pred = pred[:, :, :(y_end - y), :(x_end - x)]
+                
+                # Add to prediction canvas
+                prediction_canvas[:, :, y:y_end, x:x_end] += pred
+                count_canvas[:, :, y:y_end, x:x_end] += 1
+        
+        # Average overlapping predictions (with safety check for division by zero)
+        epsilon = 1e-8
+        final_prediction = prediction_canvas / (count_canvas + epsilon)
+        
+        return final_prediction
 
 
 class TTAEvaluator:
@@ -396,7 +450,9 @@ class TTAEvaluator:
                 )
                 
                 # Regular prediction for comparison
-                regular_prediction = tta_predictor.predict_regular(full_image)
+                regular_prediction = tta_predictor.predict_regular(
+                    full_image, patch_size=patch_size, stride=stride
+                )
                 
                 # Visualize if enabled
                 if visualize:

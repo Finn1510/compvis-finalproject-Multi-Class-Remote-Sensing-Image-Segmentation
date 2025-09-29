@@ -708,21 +708,13 @@ class DDCMTrainer:
         return self.history
     
     def plot_training_history(self, figsize=(15, 5)):
-        """Plot training history with optional learning rate visualization"""
         if not self.history['train_loss']:
             print("No training history to plot")
             return
         
         epochs = range(1, len(self.history['train_loss']) + 1)
         
-        # Check if learning rate data is available
-        has_lr_data = 'lr' in self.history and len(self.history['lr']) == len(self.history['train_loss'])
-        
-        if has_lr_data:
-            fig, axes = plt.subplots(2, 2, figsize=(figsize[0], figsize[1] * 1.3))
-            axes = axes.flatten()
-        else:
-            fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
         
         # Loss
         axes[0].plot(epochs, self.history['train_loss'], 'b-', label='Train', linewidth=2)
@@ -751,18 +743,9 @@ class DDCMTrainer:
         axes[2].legend()
         axes[2].grid(True, alpha=0.3)
         
-        # Learning rate (if available)
-        if has_lr_data:
-            axes[3].plot(epochs, self.history['lr'], 'g-', linewidth=2)
-            axes[3].set_title('Learning Rate')
-            axes[3].set_xlabel('Epoch')
-            axes[3].set_ylabel('Learning Rate')
-            axes[3].set_yscale('log')  # Log scale for better visualization
-            axes[3].grid(True, alpha=0.3)
-        
         plt.tight_layout()
         plt.show()
-    
+
     def predict(self, images):
         """Make predictions on images"""
         self.model.eval()
