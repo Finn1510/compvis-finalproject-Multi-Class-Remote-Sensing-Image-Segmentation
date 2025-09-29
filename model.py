@@ -35,18 +35,6 @@ def adjust_learning_rate(optimizer, curr_iter, initial_lr, max_iter, power=0.9):
         param_group['lr'] = lr
 
 
-class PolynomialLR(torch.optim.lr_scheduler._LRScheduler):
-    """Polynomial learning rate decay scheduler"""
-    
-    def __init__(self, optimizer, max_iter, power=0.9, last_epoch=-1):
-        self.max_iter = max_iter
-        self.power = power
-        super().__init__(optimizer, last_epoch)
-    
-    def get_lr(self):
-        return [base_lr * (1 - self.last_epoch / self.max_iter) ** self.power
-                for base_lr in self.base_lrs]
-
 
 class DDCMModule(nn.Module):
     """
@@ -356,9 +344,9 @@ class DDCMTrainer:
         miou = np.mean(ious)
         return accuracy.item(), miou
     
-    def train_epoch(self, train_loader, optimizer, criterion, scheduler=None, use_batch_step=False, 
-                   use_dual_lr=False, curr_iter=0, initial_lr=6.01e-5, max_iter=None):
-        """Train for one epoch with pixel-weighted averaging and optional dual LR scheduling"""
+    def train_epoch(self, train_loader, optimizer, criterion, scheduler=None, 
+                   curr_iter=0, initial_lr=6.01e-5, max_iter=None):
+        """Train for one epoch with pixel-weighted averaging and dual LR scheduling"""
         self.model.train()
         train_loss_meter = AverageMeter()
         train_acc_meter = AverageMeter()
@@ -376,13 +364,9 @@ class DDCMTrainer:
             optimizer.step()
             
             # Dual LR scheduling: per-iteration polynomial decay
-            if use_dual_lr and max_iter is not None:
+            if max_iter is not None:
                 adjust_learning_rate(optimizer, curr_iter, initial_lr, max_iter)
                 curr_iter += 1
-            
-            # Update polynomial scheduler per batch if used (single LR mode)
-            if use_batch_step and scheduler is not None and not use_dual_lr:
-                scheduler.step()
             
             # Metrics
             acc, miou = self.compute_metrics(outputs, targets)
@@ -433,21 +417,17 @@ class DDCMTrainer:
         return val_loss_meter.avg, val_acc_meter.avg, val_miou_meter.avg
     
     def fit(self, train_loader, val_loader, epochs=50, lr=6.01e-5, weight_decay=2e-5, 
-            class_weights=None, use_mfb=True, lr_scheduler='step', use_dual_lr=False, cache_params=None):
+            class_weights=None, use_mfb=True, cache_params=None):
         """
         Train the model using best practices from the DDCM-Net paper:
         - Adam optimizer with AMSGrad
         - Weight decay 2e-5 applied only to weights (not biases/batch-norm)
         - Learning rate 8.5e-5/√2 ≈ 6.01e-5 for weights, 2x for biases
-        - StepLR schedule: 0.85 decay every 15 epochs (default)
-        - Alternative: Polynomial decay with power 0.9
         - Dual LR scheduling: per-iteration polynomial + per-epoch StepLR
         - Cross-entropy loss with median frequency balancing (MFB)
         - Pixel-weighted averaging (matches paper implementation)
         
         Args:
-            lr_scheduler: 'step' for StepLR (default) or 'poly' for polynomial decay
-            use_dual_lr: Enable dual LR scheduling (per-iteration + per-epoch)
             cache_params: Dict with dataset info for caching class weights (e.g., {'dataset': 'potsdam', 'batch_size': 5, 'patch_size': 256})
         """
         # Compute median frequency balancing weights if requested and not provided
@@ -488,55 +468,30 @@ class DDCMTrainer:
         
         optimizer = torch.optim.Adam(param_groups, amsgrad=True)
         
-        # Initialize iteration counter
         curr_iter = 0
-        
-        # Setup learning rate scheduler
-        if use_dual_lr:
-            # Dual LR scheduling: per-iteration polynomial + per-epoch StepLR
-            max_iter = epochs * len(train_loader)
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
-            use_batch_step = False
-            print("Using dual LR scheduling: per-iteration polynomial + per-epoch StepLR")
-        elif lr_scheduler == 'poly':
-            max_iter = epochs * len(train_loader)
-            scheduler = PolynomialLR(optimizer, max_iter, power=0.9)
-            use_batch_step = True  # Poly scheduler steps per batch
-        else:  # default: step
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
-            use_batch_step = False  # Step scheduler steps per epoch
+        max_iter = epochs * len(train_loader)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.85)
         
         best_miou = 0
         
         print(f"Training on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        if use_dual_lr:
-            print(f"Dual LR mode: per-iteration polynomial (lr={lr:.2e}) + per-epoch StepLR (γ=0.85, step=15)")
-        else:
-            print(f"Single LR mode: {lr_scheduler} scheduler")
+        print(f"Using dual LR scheduling: per-iteration polynomial (lr={lr:.2e}) + per-epoch StepLR (γ=0.85, step=15)")
         print("Using pixel-weighted averaging")
         
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}")
             
-            # Train with dual LR support
-            if use_dual_lr:
-                train_loss, train_acc, train_miou, curr_iter = self.train_epoch(
-                    train_loader, optimizer, criterion, scheduler, use_batch_step,
-                    use_dual_lr=True, curr_iter=curr_iter, initial_lr=lr, 
-                    max_iter=epochs * len(train_loader)
-                )
-            else:
-                train_loss, train_acc, train_miou, _ = self.train_epoch(
-                    train_loader, optimizer, criterion, scheduler, use_batch_step
-                )
+            # Train with dual LR scheduling
+            train_loss, train_acc, train_miou, curr_iter = self.train_epoch(
+                train_loader, optimizer, criterion, scheduler, 
+                curr_iter=curr_iter, initial_lr=lr, max_iter=max_iter
+            )
             
             # Validate
             val_loss, val_acc, val_miou = self.validate_epoch(val_loader, criterion)
             
-            # Update scheduler (StepLR per epoch, including in dual mode)
-            if not use_batch_step or use_dual_lr:
-                scheduler.step()
+            scheduler.step()
             
             # Save history including learning rate
             current_lr = optimizer.param_groups[0]['lr']
