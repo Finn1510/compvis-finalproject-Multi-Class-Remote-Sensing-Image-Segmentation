@@ -58,7 +58,6 @@ class DDCMModule(nn.Module):
         self.dilated_layers = nn.ModuleList()
         
         for idx, dilation_rate in enumerate(dilation_rates):
-            # Input channels grow with each layer: original + (idx * out_channels)
             layer_in_channels = self.in_channels + idx * out_channels
             padding = dilation_rate * (kernel_size - 1) // 2
             
@@ -78,7 +77,7 @@ class DDCMModule(nn.Module):
             )
             self.dilated_layers.append(layer)
         
-        # Final merging layer - processes all accumulated features
+        # merging layer
         final_in_channels = self.in_channels + out_channels * self.num_layers
         self.merge_layer = nn.Sequential(
             nn.Conv2d(final_in_channels, self.out_channels, kernel_size=1, bias=bias),
@@ -102,7 +101,6 @@ class DDCMModule(nn.Module):
             # Concatenate output with all previous features (dense connection)
             current_input = torch.cat([layer_output, current_input], dim=1)
         
-        # Apply final merging layer
         output = self.merge_layer(current_input)
         
         return output
@@ -203,25 +201,23 @@ class DDCMNet(nn.Module):
         # High-level features path: Input -> Backbone -> DDCM1 -> 4x up -> DDCM2 -> 2x up -> half resolution
         high_features = self.backbone(x)
         high_decoded1 = self.high_level_decoder1(high_features)
-        # Apply 4x upsampling as specified in the paper (32 -> 128)
+        
         high_decoded1 = F.interpolate(
             high_decoded1, scale_factor=4, 
             mode='bilinear', align_corners=False
         )
         high_decoded2 = self.high_level_decoder2(high_decoded1)
-        # Apply 2x upsampling to match low-level features (128 -> 256)
+        
         high_decoded2 = F.interpolate(
             high_decoded2, scale_factor=2, 
             mode='bilinear', align_corners=False
         )
         
-        # Both paths should be at half resolution for fusion
         fused = torch.cat([low_features, high_decoded2], dim=1)
         
-        # Final prediction 
         x = self.classifier(fused)
         
-        # Upsample back to original input size (up-argmax pipeline)
+        # Upsample back to original input size 
         return F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
 
 
@@ -240,7 +236,7 @@ class DDCMTrainer:
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
             'train_miou': [], 'val_miou': [],
-            'lr': []  # Learning rate tracking for enhanced training
+            'lr': [] 
         }
     
     def compute_class_weights(self, dataloader, method='median_frequency', cache_params=None):
@@ -363,12 +359,10 @@ class DDCMTrainer:
             loss.backward()
             optimizer.step()
             
-            # Dual LR scheduling: per-iteration polynomial decay
             if max_iter is not None:
                 adjust_learning_rate(optimizer, curr_iter, initial_lr, max_iter)
                 curr_iter += 1
             
-            # Metrics
             acc, miou = self.compute_metrics(outputs, targets)
             
             # Pixel-weighted averaging
@@ -434,7 +428,6 @@ class DDCMTrainer:
         if use_mfb and class_weights is None:
             class_weights = self.compute_class_weights(train_loader, method='median_frequency', cache_params=cache_params)
         
-        # Setup parameter groups with different weight decay and learning rates
         weight_params = []
         bias_params = []
         bn_params = []
@@ -450,7 +443,6 @@ class DDCMTrainer:
             else:
                 weight_params.append(param)
         
-        # Parameter groups: weights with weight decay, biases with 2x LR, batch-norm without weight decay
         param_groups = [
             {'params': weight_params, 'lr': lr, 'weight_decay': weight_decay},
             {'params': bias_params, 'lr': 2 * lr, 'weight_decay': 0.0},
@@ -476,8 +468,6 @@ class DDCMTrainer:
         
         print(f"Training on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"Using dual LR scheduling: per-iteration polynomial (lr={lr:.2e}) + per-epoch StepLR (γ=0.85, step=15)")
-        print("Using pixel-weighted averaging")
         
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}")
@@ -503,7 +493,6 @@ class DDCMTrainer:
             self.history['val_miou'].append(val_miou)
             self.history['lr'].append(current_lr)
             
-            # Print metrics
             print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.3f}, mIoU: {train_miou:.3f}")
             print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.3f}, mIoU: {val_miou:.3f}")
             
@@ -575,7 +564,7 @@ class DDCMTrainer:
         else:
             criterion = nn.CrossEntropyLoss()
         
-        # Reset history for this training session
+        # Reset history for training session
         self.history = {
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
@@ -595,7 +584,6 @@ class DDCMTrainer:
         for epoch in range(epochs):
             print(f"\nEpoch {epoch+1}/{epochs}")
             
-            # Training phase
             self.model.train()
             train_loss = 0.0
             train_correct = 0
@@ -1040,7 +1028,7 @@ class GlobalContextModule(nn.Module):
         
         # Output projection back to original channels
         self.output_proj = nn.Conv2d(embed_dim, in_channels, 1)
-        # Use regular Dropout instead of Dropout2d for small channel counts
+
         if in_channels <= 8:
             self.dropout = nn.Identity()  # Skip dropout for very small channels
         else:
@@ -1108,7 +1096,6 @@ class DDCMNetEnhanced(nn.Module):
                 'pos_embed': True
             }
         
-        # Low-level encoder (same as original)
         self.low_level_encoder = DDCMModule(
             in_channels=3, 
             out_channels=3, 
@@ -1124,10 +1111,8 @@ class DDCMNetEnhanced(nn.Module):
                 in_channels=3, **global_context_config
             )
         
-        # Backbone (same as original)
         self.backbone = ResNetBackbone(backbone_name, pretrained)
         
-        # High-level decoders (same as original)
         self.high_level_decoder1 = DDCMModule(
             in_channels=1024, 
             out_channels=36,
@@ -1146,7 +1131,7 @@ class DDCMNetEnhanced(nn.Module):
             dilation_rates=[1]
         )
         
-        # Fusion and classification (same as original)
+        # Fusion and classification 
         self.classifier = nn.Conv2d(21, num_classes, kernel_size=3, padding=1)  # 3 + 18 = 21
         
         self._init_weights()
@@ -1218,10 +1203,8 @@ class DDCMNetEnhanced(nn.Module):
             mode='bilinear', align_corners=False
         )
         
-        # Both paths should be at half resolution for fusion
         fused = torch.cat([low_features, high_decoded2], dim=1)
         
-        # Final prediction 
         x = self.classifier(fused)
         
         # Upsample back to original input size

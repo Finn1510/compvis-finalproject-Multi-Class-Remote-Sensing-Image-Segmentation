@@ -113,7 +113,6 @@ class PotsdamVaihingenDataset(Dataset):
             warnings.warn(f"Potsdam dataset not found in {self.root_dir}/potsdam/")
             return [], []
         
-        # Potsdam train/test split convention
         if self.split == 'train':
             area_ids = ['2_10', '2_11', '2_12', '3_10', '3_11', '3_12', '4_11', '4_12', '5_10', '5_12', '6_7', '6_8', '6_10', '6_11', '6_12', '7_7', '7_9', '7_8', '7_12']
         elif self.split == 'test':
@@ -193,7 +192,6 @@ class PotsdamVaihingenDataset(Dataset):
                     width, height = img.size
                 
                 # Check if image is large enough for patches
-                # Use fixed patch size
                 effective_patch_size = self.patch_size
                 max_x = width - effective_patch_size
                 max_y = height - effective_patch_size
@@ -218,27 +216,23 @@ class PotsdamVaihingenDataset(Dataset):
         
         print(f"Preparing deterministic patch sampling for {self.split} split...")
         
-        # Use fixed patch size for validation/test
         current_patch_size = self.patch_size
         
-        # Create deterministic patches using grid sampling
-        patch_coords = []  # Will store (img_path, lbl_path, x, y, patch_size, img_idx)
+        # grid sampling
+        patch_coords = []  # (img_path, lbl_path, x, y, patch_size, img_idx)
         
         for img_idx, (img_path, lbl_path) in enumerate(zip(self.image_paths, self.label_paths)):
             try:
-                # Load image to get dimensions
                 with Image.open(img_path) as img:
                     width, height = img.size
                 
                 # Calculate grid parameters for systematic sampling
-                # Use non-overlapping patches for faster validation
                 stride = current_patch_size
                 
                 # Generate grid coordinates
                 x_coords = list(range(0, width - current_patch_size + 1, stride))
                 y_coords = list(range(0, height - current_patch_size + 1, stride))
                 
-                # Ensure we include the rightmost and bottommost patches
                 if x_coords[-1] < width - current_patch_size:
                     x_coords.append(width - current_patch_size)
                 if y_coords[-1] < height - current_patch_size:
@@ -287,8 +281,7 @@ class PotsdamVaihingenDataset(Dataset):
     def _get_random_patch(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a random patch for training (ignores idx for true random sampling)."""
         # Note: Each call provides uniform random sampling
-        # The 'idx' parameter is ignored in favor of true random sampling
-        # This ensures uniform random sampling across the entire dataset for each epoch
+        # 'idx' parameter is ignored in favor of true random sampling
         
         # Randomly select an image from valid images (uniform sampling)
         img_info = random.choice(self.valid_images)
@@ -300,7 +293,6 @@ class PotsdamVaihingenDataset(Dataset):
             img_width = base_max_x + self.patch_size
             img_height = base_max_y + self.patch_size
         
-        # Use fixed patch size
         current_patch_size = self.patch_size
         
         # Calculate valid sampling region for current patch size
@@ -309,7 +301,6 @@ class PotsdamVaihingenDataset(Dataset):
         
         # Ensure valid sampling region exists
         if max_x < 0 or max_y < 0:
-            # Fall back to fixed patch size if current size doesn't fit
             max_x = img_width - current_patch_size
             max_y = img_height - current_patch_size
         
@@ -321,11 +312,10 @@ class PotsdamVaihingenDataset(Dataset):
     
     def _get_deterministic_patch(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a deterministic patch for validation/test using the provided index."""
-        # For deterministic sampling, use the actual idx to get a specific patch
+        # For deterministic sampling, use the actual idx 
         if idx >= len(self.valid_images):
             raise IndexError(f"Index {idx} out of range for {len(self.valid_images)} patches")
         
-        # Extract patch coordinates from pre-computed list
         patch_info = self.valid_images[idx]
         img_path, lbl_path, x, y, current_patch_size, img_idx = patch_info
         
@@ -370,8 +360,6 @@ class PotsdamVaihingenDataset(Dataset):
                 if not isinstance(t, transforms.ToTensor):
                     img_tensor = t(img_tensor)
         
-        # ToTensor already converted from [0, 255] to [0.0, 1.0], so we keep this normalization
-            
         # Convert label to long tensor
         lbl_tensor = lbl_tensor.long()
             
@@ -411,8 +399,6 @@ class PotsdamVaihingenDataset(Dataset):
         # Convert to tensors
         img_tensor = transforms.ToTensor()(Image.fromarray(img_array))
         lbl_tensor = torch.from_numpy(lbl_array.astype(np.uint8)).long()
-        
-        # ToTensor already provides [0.0, 1.0] normalization, so we keep it as is
         
         # Add batch dimension
         img_tensor = img_tensor.unsqueeze(0)  # [1, 3, H, W]
@@ -467,9 +453,7 @@ class PotsdamVaihingenDataset(Dataset):
 
 def worker_init_fn(worker_id):
     """Initialize each worker with a different random seed for data augmentation"""
-    # Get initial seed and ensure it's within valid range for numpy
     base_seed = torch.initial_seed()
-    # Ensure seed is within numpy's valid range (0 to 2^32 - 1)
     worker_seed = (base_seed + worker_id) % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
@@ -477,11 +461,8 @@ def worker_init_fn(worker_id):
 
 # TODO Refactor this
 def get_transforms(is_training: bool = True) -> Tuple[Optional[transforms.Compose], Optional[transforms.Compose]]:
-    """Get data transforms for training/validation."""
     
-    img_transform = None  # No additional transforms needed - images stay in [0.0, 1.0] range
-        
-    # For labels, just convert to long tensor (already handled in __getitem__)
+    img_transform = None  
     lbl_transform = None
     
     return img_transform, lbl_transform
@@ -565,17 +546,17 @@ def create_dataloaders(root_dir: str,
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,                    # Essential for training: randomizes batch composition
+        shuffle=True,                   
         num_workers=num_workers,
         pin_memory=pin_memory,          
-        drop_last=drop_last,            # Ensures consistent batch sizes for training
+        drop_last=drop_last,            # consistent batch sizes for training
         worker_init_fn=worker_init_fn   # Ensures different seeds for each worker
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        shuffle=False,                  # No shuffling needed for validation
+        shuffle=False,                  
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False                 # Keep all validation data
@@ -584,7 +565,7 @@ def create_dataloaders(root_dir: str,
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
-        shuffle=False,                  # No shuffling needed for testing
+        shuffle=False,                  
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False                 # Keep all test data
@@ -593,7 +574,7 @@ def create_dataloaders(root_dir: str,
     holdout_loader = DataLoader(
         holdout_dataset,
         batch_size=batch_size,
-        shuffle=False,                  # No shuffling needed for holdout evaluation
+        shuffle=False,                  
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False                 # Keep all holdout data
@@ -613,7 +594,7 @@ if __name__ == "__main__":
         val_patch_size=448,
         batch_size=8,
         num_workers=2,
-        num_training_patches=5000  # Configurable training patches per epoch
+        num_training_patches=5000 
     )
     
     print(f"Train batches: {len(train_loader)}")
