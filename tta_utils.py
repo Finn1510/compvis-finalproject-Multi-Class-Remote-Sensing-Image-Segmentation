@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
+import time
 
 
 class TTATransforms:
@@ -111,6 +112,9 @@ class TTAPredictor:
         
         print(f"Applying TTA with {patch_size}×{patch_size} patches, stride={stride}")
         
+        # Start timing
+        start_time = time.time()
+        
         # Calculate positions for sliding windows (ensuring full coverage)
         y_positions = []
         x_positions = []
@@ -199,8 +203,12 @@ class TTAPredictor:
             uncovered_pixels = uncovered_mask.sum()
             print(f"   Uncovered pixels: {uncovered_pixels}/{count_canvas.numel()}")
         
-        print("TTA inference completed!")
-        return final_prediction
+        # End timing
+        end_time = time.time()
+        inference_time = end_time - start_time
+        print(f"TTA inference completed in {inference_time:.2f} seconds!")
+        
+        return final_prediction, inference_time
     
     def predict_regular(self, image, patch_size=448, stride=100):
         """
@@ -225,10 +233,17 @@ class TTAPredictor:
         # Move to device
         image = image.to(self.device)
         
+        # Start timing
+        start_time = time.time()
+        
         # For small images, use direct prediction
         if height <= patch_size and width <= patch_size:
             with torch.no_grad():
-                return self.model(image)
+                prediction = self.model(image)
+                # End timing
+                end_time = time.time()
+                inference_time = end_time - start_time
+                return prediction, inference_time
         
         # Initialize output canvas and count map for sliding window
         prediction_canvas = torch.zeros(batch_size, self.num_classes, height, width, device=self.device)
@@ -286,7 +301,11 @@ class TTAPredictor:
         epsilon = 1e-8
         final_prediction = prediction_canvas / (count_canvas + epsilon)
         
-        return final_prediction
+        # End timing
+        end_time = time.time()
+        inference_time = end_time - start_time
+        
+        return final_prediction, inference_time
 
 
 class TTAEvaluator:
@@ -424,6 +443,8 @@ class TTAEvaluator:
         all_reg_ious = []
         all_class_tta_accuracies = [[] for _ in range(len(self.class_names))]
         all_class_reg_accuracies = [[] for _ in range(len(self.class_names))]
+        all_tta_times = []
+        all_reg_times = []
         
         # Process each image
         for img_idx, img_name in enumerate(available_images):
@@ -445,12 +466,12 @@ class TTAEvaluator:
                     full_label = full_label[start_h:start_h+crop_h, start_w:start_w+crop_w]
                 
                 # Apply TTA
-                tta_prediction = tta_predictor.predict_with_sliding_window_tta(
+                tta_prediction, tta_time = tta_predictor.predict_with_sliding_window_tta(
                     full_image, patch_size=patch_size, stride=stride
                 )
                 
                 # Regular prediction for comparison
-                regular_prediction = tta_predictor.predict_regular(
+                regular_prediction, reg_time = tta_predictor.predict_regular(
                     full_image, patch_size=patch_size, stride=stride
                 )
                 
@@ -477,6 +498,8 @@ class TTAEvaluator:
                 all_reg_accuracies.append(reg_acc)
                 all_tta_ious.append(tta_miou)
                 all_reg_ious.append(reg_miou)
+                all_tta_times.append(tta_time)
+                all_reg_times.append(reg_time)
                 
                 # Store class-wise results
                 for class_id in range(len(self.class_names)):
@@ -488,13 +511,26 @@ class TTAEvaluator:
                         all_class_tta_accuracies[class_id].append(tta_class_acc)
                         all_class_reg_accuracies[class_id].append(reg_class_acc)
                 
-                print(f"  Regular: Acc={reg_acc:.3f}, mIoU={reg_miou:.3f}")
-                print(f"  TTA: Acc={tta_acc:.3f}, mIoU={tta_miou:.3f}")
+                print(f"  Regular: Acc={reg_acc:.3f}, mIoU={reg_miou:.3f}, Time={reg_time:.2f}s")
+                print(f"  TTA: Acc={tta_acc:.3f}, mIoU={tta_miou:.3f}, Time={tta_time:.2f}s")
                 print(f"  Improvement: Acc={tta_acc - reg_acc:+.3f}, mIoU={tta_miou - reg_miou:+.3f}")
+                print(f"  Time Overhead: {tta_time - reg_time:+.2f}s ({tta_time/reg_time:.1f}x slower)" if reg_time > 0 else "")
                 
             except Exception as e:
                 print(f"  Error processing {img_name}: {e}")
                 continue
+        
+        # Calculate per-class accuracy averages
+        avg_class_tta_accuracies = []
+        avg_class_reg_accuracies = []
+        
+        for class_id in range(len(self.class_names)):
+            if all_class_tta_accuracies[class_id]:  # Only if we have data for this class
+                avg_class_tta_accuracies.append(np.mean(all_class_tta_accuracies[class_id]))
+                avg_class_reg_accuracies.append(np.mean(all_class_reg_accuracies[class_id]))
+            else:
+                avg_class_tta_accuracies.append(0.0)
+                avg_class_reg_accuracies.append(0.0)
         
         # Aggregate results
         if all_tta_accuracies:
@@ -510,7 +546,19 @@ class TTAEvaluator:
                 'all_tta_accuracies': all_tta_accuracies,
                 'all_reg_accuracies': all_reg_accuracies,
                 'all_tta_ious': all_tta_ious,
-                'all_reg_ious': all_reg_ious
+                'all_reg_ious': all_reg_ious,
+                'avg_class_tta_accuracies': avg_class_tta_accuracies,
+                'avg_class_reg_accuracies': avg_class_reg_accuracies,
+                'all_class_tta_accuracies': all_class_tta_accuracies,
+                'all_class_reg_accuracies': all_class_reg_accuracies,
+                'avg_tta_time': np.mean(all_tta_times),
+                'avg_reg_time': np.mean(all_reg_times),
+                'total_tta_time': np.sum(all_tta_times),
+                'total_reg_time': np.sum(all_reg_times),
+                'all_tta_times': all_tta_times,
+                'all_reg_times': all_reg_times,
+                'avg_time_overhead': np.mean(all_tta_times) - np.mean(all_reg_times),
+                'avg_speedup_factor': np.mean(all_tta_times) / np.mean(all_reg_times) if np.mean(all_reg_times) > 0 else 0
             }
             
             # Print summary
@@ -524,6 +572,22 @@ class TTAEvaluator:
             print(f"Average Regular mIoU: {results['avg_reg_miou']:.4f}")
             print(f"Average TTA mIoU: {results['avg_tta_miou']:.4f}")
             print(f"mIoU Improvement: {results['miou_improvement']:+.4f}")
+            
+            # Print timing statistics
+            print(f"\nTiming Statistics:")
+            print(f"Average Regular Time: {results['avg_reg_time']:.2f}s per image")
+            print(f"Average TTA Time: {results['avg_tta_time']:.2f}s per image")
+            print(f"Time Overhead: {results['avg_time_overhead']:+.2f}s ({results['avg_speedup_factor']:.1f}x slower)")
+            print(f"Total Processing Time: Regular={results['total_reg_time']:.1f}s, TTA={results['total_tta_time']:.1f}s")
+            
+            # Print per-class accuracy summary
+            print(f"\nPer-Class Accuracy (Durchschnitt):")
+            for class_id, class_name in enumerate(self.class_names):
+                if avg_class_reg_accuracies[class_id] > 0:  # Only show classes with data
+                    reg_acc = avg_class_reg_accuracies[class_id]
+                    tta_acc = avg_class_tta_accuracies[class_id]
+                    improvement = tta_acc - reg_acc
+                    print(f"  {class_id}: {class_name:<20} Reg: {reg_acc:.3f} -> TTA: {tta_acc:.3f} ({improvement:+.3f})")
             
             return results
         else:
@@ -567,13 +631,14 @@ class TTAEvaluator:
             print(f"MODEL COMPARISON SUMMARY")
             print(f"{'='*80}")
             
-            print(f"{'Model':<20} {'Reg Acc':<10} {'TTA Acc':<10} {'Acc Δ':<10} {'Reg mIoU':<10} {'TTA mIoU':<10} {'mIoU Δ':<10}")
-            print("-" * 80)
+            print(f"{'Model':<20} {'Reg Acc':<8} {'TTA Acc':<8} {'Acc Δ':<8} {'Reg mIoU':<8} {'TTA mIoU':<8} {'mIoU Δ':<8} {'Reg Time':<10} {'TTA Time':<10} {'Speedup':<8}")
+            print("-" * 120)
             
             for model_name, results in all_results.items():
-                print(f"{model_name:<20} {results['avg_reg_acc']:<10.3f} {results['avg_tta_acc']:<10.3f} "
-                      f"{results['acc_improvement']:<10.3f} {results['avg_reg_miou']:<10.3f} "
-                      f"{results['avg_tta_miou']:<10.3f} {results['miou_improvement']:<10.3f}")
+                print(f"{model_name:<20} {results['avg_reg_acc']:<8.3f} {results['avg_tta_acc']:<8.3f} "
+                      f"{results['acc_improvement']:<8.3f} {results['avg_reg_miou']:<8.3f} "
+                      f"{results['avg_tta_miou']:<8.3f} {results['miou_improvement']:<8.3f} "
+                      f"{results['avg_reg_time']:<10.2f} {results['avg_tta_time']:<10.2f} {results['avg_speedup_factor']:<8.1f}")
         
         return all_results
 
